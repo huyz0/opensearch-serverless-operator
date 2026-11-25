@@ -1,0 +1,245 @@
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+@@ -54,6 +54,7 @@
+     @InternalApi
+     public enum RetirementState {
+         OPEN,
++        WITHDRAWN,
+         CLOSING,
+         CLOSED,
+         CONFLICT
+@@ -68,18 +69,37 @@
+         if (retirementOperation.equals(operation) == false) {
+             return RetirementState.CONFLICT;
+         }
++        if (writerAdmissionClosed == false) {
++            return RetirementState.WITHDRAWN;
++        }
+         return admittedWritersDrained ? RetirementState.CLOSED : RetirementState.CLOSING;
+     }
+ 
+-    /** Reserves writer admission for one operation, then waits for the previously admitted opens. */
++    /** Reserves the JVM for one retirement and withdraws client readiness without closing writer admission. */
++    @InternalApi
++    public synchronized RetirementState withdrawForRetirement(String operation) {
++        final RetirementState state = retirementState(operation);
++        if (state != RetirementState.OPEN) {
++            return state;
++        }
++        retirementOperation = java.util.Objects.requireNonNull(operation);
++        return RetirementState.WITHDRAWN;
++    }
++
++    /** Whether the JVM has withdrawn client readiness for a writer retirement. */
++    @InternalApi
++    public synchronized boolean isWriterTrafficWithdrawn() {
++        return retirementOperation != null;
++    }
++
++    /** Closes writer admission for the reserved operation and waits for previously admitted opens. */
+     @InternalApi
+     public RetirementState prepareRetirement(String operation) {
+         synchronized (this) {
+             final RetirementState state = retirementState(operation);
+-            if (state != RetirementState.OPEN) {
++            if (state != RetirementState.WITHDRAWN) {
+                 return state;
+             }
+-            retirementOperation = java.util.Objects.requireNonNull(operation);
+             writerAdmissionClosed = true;
+         }
+         closeWriterAdmission();
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
+@@ -116,7 +116,7 @@
+         final String retirementPreparer = NodeSettings.WRITER_RETIREMENT_PREPARER.get(node.settings());
+         if (retirementPreparer.isBlank() == false
+             && NodeSettings.PERSIST_WRITER_HANDOFF.get(node.settings())
+-            && node.roles().contains("ingest")
++            && node.roles().equals(Set.of("ingest"))
+             && node.plugins().filter(IdentityPlugin.class).isEmpty() == false) {
+             controller.registerHandler(
+                 guarded.apply(
+@@ -223,7 +223,11 @@
+             )
+         );
+         controller.registerHandler(
+-            new org.opensearch.serverless.rest.ServerlessReadyHandler(() -> node.isStarted(), () -> SearchReadiness.of(node))
++            new org.opensearch.serverless.rest.ServerlessReadyHandler(
++                node::isStarted,
++                () -> SearchReadiness.of(node),
++                () -> node.activation().isWriterTrafficWithdrawn()
++            )
+         );
+         controller.registerHandler(
+             new org.opensearch.serverless.rest.ServerlessDrainHandler(
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
+@@ -30,6 +30,7 @@
+ /** Reserves and drains writer admission for one operation on this JVM. */
+ public final class WriterRetirementHandler extends BaseRestHandler {
+     private static final String PATH = "/_serverless/writer_retirement/{node_id}/{ephemeral_id}/{operation_id}";
++    private static final String WITHDRAWAL = "/_serverless/writer_withdrawal/";
+     private final NodeContext node;
+     private final Supplier<Principal> principal;
+     private final String preparer;
+@@ -47,7 +48,11 @@
+ 
+     @Override
+     public List<Route> routes() {
+-        return List.of(new Route(RestRequest.Method.GET, PATH), new Route(RestRequest.Method.POST, PATH));
++        return List.of(
++            new Route(RestRequest.Method.GET, PATH),
++            new Route(RestRequest.Method.POST, PATH),
++            new Route(RestRequest.Method.POST, WITHDRAWAL + "{node_id}/{ephemeral_id}/{operation_id}")
++        );
+     }
+ 
+     @Override
+@@ -84,10 +89,23 @@
+         if (request.method() == RestRequest.Method.GET) {
+             return channel -> respond(channel, nodeId, ephemeralId, operation, node.activation().retirementState(operation));
+         }
++        if (request.path().startsWith(WITHDRAWAL)) {
++            return channel -> respond(channel, nodeId, ephemeralId, operation, node.activation().withdrawForRetirement(operation));
++        }
+         return channel -> node.threadPool().generic().execute(new AbstractRunnable() {
+             @Override
+             protected void doRun() throws IOException {
+-                respond(channel, nodeId, ephemeralId, operation, node.activation().prepareRetirement(operation));
++                final RetirementState state = node.activation().prepareRetirement(operation);
++                if (state == RetirementState.OPEN) {
++                    error(
++                        channel,
++                        RestStatus.CONFLICT,
++                        "writer_traffic_not_withdrawn",
++                        "reserve writer traffic withdrawal before preparation"
++                    );
++                } else {
++                    respond(channel, nodeId, ephemeralId, operation, state);
++                }
+             }
+ 
+             @Override
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/ServerlessReadyHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/ServerlessReadyHandler.java
+@@ -33,6 +33,7 @@
+ 
+     private final BooleanSupplier started;
+     private final Supplier<SearchReadiness> readiness;
++    private final BooleanSupplier writerTrafficWithdrawn;
+ 
+     /**
+      * Creates the handler.
+@@ -41,8 +42,13 @@
+      * @param readiness the node's search readiness
+      */
+     public ServerlessReadyHandler(BooleanSupplier started, Supplier<SearchReadiness> readiness) {
++        this(started, readiness, () -> false);
++    }
++
++    public ServerlessReadyHandler(BooleanSupplier started, Supplier<SearchReadiness> readiness, BooleanSupplier writerTrafficWithdrawn) {
+         this.started = started;
+         this.readiness = readiness;
++        this.writerTrafficWithdrawn = writerTrafficWithdrawn;
+     }
+ 
+     @Override
+@@ -59,13 +65,17 @@
+     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+         final boolean up = started.getAsBoolean();
+         final SearchReadiness search = readiness.get();
+-        final boolean ready = up && search.ready();
++        final boolean withdrawn = writerTrafficWithdrawn.getAsBoolean();
++        final boolean ready = up && search.ready() && withdrawn == false;
++        final String state = up == false ? "starting"
++            : withdrawn ? "writer_traffic_withdrawn"
++            : search.state().name().toLowerCase(java.util.Locale.ROOT);
+         final SearchReadiness.WarmupSnapshot warmup = search.warmupSnapshot();
+         return channel -> {
+             try (XContentBuilder builder = channel.newBuilder()) {
+                 builder.startObject();
+                 builder.field("ready", ready);
+-                builder.field("state", up ? search.state().name().toLowerCase(java.util.Locale.ROOT) : "starting");
++                builder.field("state", state);
+                 builder.field("serves_searches", search.servesSearches());
+                 builder.field("process_incarnation", warmup.incarnation());
+                 builder.field("warmup_result", warmup.result().name().toLowerCase(java.util.Locale.ROOT));
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java
+@@ -125,6 +125,10 @@
+                 try {
+                     final var first = workers.submit(() -> node.activation().activateWriter(metadata, "docs", 0));
+                     assertTrue(opening.await(30, TimeUnit.SECONDS));
++                    assertEquals(
++                        org.opensearch.serverless.node.WriterActivation.RetirementState.WITHDRAWN,
++                        node.activation().withdrawForRetirement("operation-a")
++                    );
+                     final var closing = workers.submit(() -> node.activation().prepareRetirement("operation-a"));
+                     assertBusy(() -> assertTrue(node.activation().isWriterAdmissionClosed()));
+                     assertEquals(
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -243,6 +243,7 @@
+         final AtomicLong clock = new AtomicLong(1_000L);
+         final MetadataPlane plane = plane(clock);
+         plane.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, DOC_MAPPING, null));
++        plane.createIndex(new IndexDescriptor("traffic", "uuid-traffic", 1, DOC_MAPPING, null));
+         final Settings settings = Settings.builder()
+             .put(nodeSettings("auth-writer-retirement"))
+             .put(NodeSettings.PERSIST_WRITER_HANDOFF.getKey(), true)
+@@ -265,6 +266,7 @@
+             final String prefix = base + "/_serverless/writer_retirement/" + process.getId() + "/";
+             final String url = prefix + process.getEphemeralId() + "/";
+             final String path = url + "operation-a";
++            final String withdrawal = base + "/_serverless/writer_withdrawal/" + process.getId() + "/" + process.getEphemeralId();
+             ready(node, plane, clock);
+             final Response created = sendAt(
+                 client,
+@@ -280,7 +282,31 @@
+             final Response unprepared = sendAt(client, "GET", path, preparer, null);
+             assertEquals(unprepared.body(), 200, unprepared.status());
+             assertTrue(unprepared.body(), unprepared.body().contains("\"state\":\"open\""));
++            assertEquals(200, sendAt(client, "GET", base + "/_serverless/ready", admin, null).status());
+             assertTrue(node.activation().activateWriter(plane, "docs", 0).isPresent());
++
++            assertEquals(409, sendAt(client, "POST", path, preparer, null).status());
++            assertEquals(403, sendAt(client, "POST", withdrawal + "/operation-a", admin, null).status());
++            final Response withdrawn = sendAt(client, "POST", withdrawal + "/operation-a", preparer, null);
++            assertEquals(withdrawn.body(), 200, withdrawn.status());
++            assertTrue(withdrawn.body(), withdrawn.body().contains("\"state\":\"withdrawn\""));
++            assertEquals(withdrawn.body(), sendAt(client, "GET", path, preparer, null).body());
++            assertEquals(withdrawn.body(), sendAt(client, "POST", withdrawal + "/operation-a", preparer, null).body());
++            assertEquals(409, sendAt(client, "POST", withdrawal + "/operation-b", preparer, null).status());
++            final Response notReady = sendAt(client, "GET", base + "/_serverless/ready", admin, null);
++            assertEquals(503, notReady.status());
++            assertTrue(notReady.body(), notReady.body().contains("\"state\":\"writer_traffic_withdrawn\""));
++            assertEquals(200, sendAt(client, "GET", base + "/_serverless/health", admin, null).status());
++            assertFalse(node.activation().isWriterAdmissionClosed());
++            assertTrue(node.activation().activateWriter(plane, "traffic", 0).isPresent());
++            final Response duringWithdrawal = sendAt(
++                client,
++                "PUT",
++                base + "/traffic/_doc/before?refresh=true",
++                admin,
++                "{\"msg\":\"withdrawn\"}"
++            );
++            assertEquals(duringWithdrawal.body(), 201, duringWithdrawal.status());
+ 
+             final Response prepared = sendAt(client, "POST", path, preparer, null);
+             assertEquals(prepared.body(), 200, prepared.status());
+@@ -292,6 +318,14 @@
+             assertTrue(node.activation().activateWriter(plane, "docs", 1).isEmpty());
+             assertTrue(plane.heads().read("docs", 1).isEmpty());
+             assertEquals(process.getEphemeralId(), plane.heads().read("docs", 0).orElseThrow().ownerEphemeralId());
++            final Response existingWriter = sendAt(
++                client,
++                "PUT",
++                base + "/traffic/_doc/after?refresh=true",
++                admin,
++                "{\"msg\":\"open writer\"}"
++            );
++            assertEquals(existingWriter.body(), 201, existingWriter.status());
+         }
+     }
+ 

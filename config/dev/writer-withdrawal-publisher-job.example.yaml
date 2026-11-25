@@ -1,0 +1,47 @@
+# Replace the image with the publisher target's exact platform digest.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: writer-withdrawal-publisher-
+  namespace: operator-platform
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: writer-withdrawal-publisher
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: publisher
+          image: example.invalid/opensearch-writer-publisher@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args:
+            - --writer-withdrawal
+            - --namespace=operator-development
+            - --operation=retire-index-writer
+            - --writer-report-configmap=operator-platform/writer-observation-report
+            - --signing-key-file=/signer/key.pem
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: signer
+              mountPath: /signer
+              readOnly: true
+      volumes:
+        - name: signer
+          secret:
+            secretName: writer-withdrawal-signing-key
+            defaultMode: 0440
+            items:
+              - key: key.pem
+                path: key.pem

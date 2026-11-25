@@ -1,0 +1,359 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/shard/WriterTerm.java b/serverless/shell/src/main/java/org/opensearch/serverless/shard/WriterTerm.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shard/WriterTerm.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shard/WriterTerm.java
+@@ -22,8 +22,25 @@
+ 
+     private volatile long term = -1L;
+     private volatile boolean stopped;
++    private volatile long acknowledgedTerm = -1L;
+ 
+     WriterTerm() {}
++
++    /** Records a completed foreground WAL append for the term that accepted it. */
++    public void recordAcknowledgedWrite(long term) {
++        if (acknowledgedTerm != term) {
++            synchronized (this) {
++                if (begun(term)) {
++                    acknowledgedTerm = term;
++                }
++            }
++        }
++    }
++
++    /** Whether this writer has acknowledged a foreground write in its current term. */
++    public boolean hasAcknowledgedWrite(long term) {
++        return acknowledgedTerm == term && begun(term);
++    }
+ 
+     /**
+      * Begins a term, then asks whether this node still owns it: a head taken and superseded before the open got here stops
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeWritePath.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeWritePath.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeWritePath.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeWritePath.java
+@@ -314,6 +314,7 @@
+         // The edge. Fired after the write is durable and applied, so a listener that publishes on it
+         // can never publish a commit describing an operation the caller was not told about.
+         node.signals.wrote(shardId);
++        node.reconciler.recordAcknowledgedWriterWrite(shardId, result.getTerm());
+         return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), result.isCreated(), true);
+     }
+ 
+@@ -576,6 +577,7 @@
+         // For the breaker, not for durability -- see index.
+         syncIfStillOpen(shard);
+         node.signals.wrote(shardId);
++        node.reconciler.recordAcknowledgedWriterWrite(shardId, result.getTerm());
+         return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), false, result.isFound());
+     }
+ 
+@@ -941,6 +943,9 @@
+         // edge is raised after everything is applied, so a publish it triggers describes the whole batch
+         // or none of it.
+         node.signals.wrote(shardId);
++        if (applied.isEmpty() == false) {
++            node.reconciler.recordAcknowledgedWriterWrite(shardId, applied.getFirst().primaryTerm());
++        }
+         return java.util.Arrays.asList(outcomes);
+     }
+ 
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/shard/ShardReconciler.java b/serverless/shell/src/main/java/org/opensearch/serverless/shard/ShardReconciler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shard/ShardReconciler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shard/ShardReconciler.java
+@@ -218,6 +218,20 @@
+             return null;
+         }
+         return writerTerms.computeIfAbsent(shardId, id -> new WriterTerm());
++    }
++
++    /** Records completion of a foreground write after its WAL append and local sync. */
++    public void recordAcknowledgedWriterWrite(ShardId shardId, long term) {
++        final WriterTerm writer = writerTerms.get(shardId);
++        if (writer != null) {
++            writer.recordAcknowledgedWrite(term);
++        }
++    }
++
++    /** Returns whether this shard has accepted a foreground write in the named writer term. */
++    public boolean hasAcknowledgedWriterWrite(ShardId shardId, long term) {
++        final WriterTerm writer = writerTerms.get(shardId);
++        return writer != null && writer.hasAcknowledgedWrite(term);
+     }
+ 
+     /** Per writer shard, the lock that keeps a commit from landing between an apply and its append. */
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java b/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
+@@ -20,6 +20,7 @@
+ import org.opensearch.serverless.rest.ServerlessRootHandler;
+ import org.opensearch.serverless.rest.WriterHandoffReceiptHandler;
+ import org.opensearch.serverless.rest.WriterRetirementHandler;
++import org.opensearch.serverless.rest.WriterSuccessorHandler;
+ import org.opensearch.serverless.rest.WriterWithdrawalViewHandler;
+ import org.opensearch.serverless.warm.SearchDrain;
+ import org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry;
+@@ -117,6 +118,18 @@
+                     new WriterHandoffReceiptHandler(
+                         node::metadataPlane,
+                         node.threadPool(),
++                        () -> node.services().identityService().getCurrentSubject().getPrincipal(),
++                        handoffReader
++                    )
++                )
++            );
++        }
++        if (handoffReader.isBlank() == false && node.roles().equals(Set.of("ingest"))
++            && node.plugins().filter(IdentityPlugin.class).isEmpty() == false) {
++            controller.registerHandler(
++                guarded.apply(
++                    new WriterSuccessorHandler(
++                        node,
+                         () -> node.services().identityService().getCurrentSubject().getPrincipal(),
+                         handoffReader
+                     )
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterSuccessorHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterSuccessorHandler.java
+new file mode 100644
+--- /dev/null
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterSuccessorHandler.java
+@@ -0,0 +1,176 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ */
++package org.opensearch.serverless.rest;
++
++import org.opensearch.common.util.concurrent.AbstractRunnable;
++import org.opensearch.core.index.shard.ShardId;
++import org.opensearch.core.rest.RestStatus;
++import org.opensearch.http.netty4.ssl.SecureNetty4HttpServerTransport;
++import org.opensearch.identity.NamedPrincipal;
++import org.opensearch.index.shard.IndexShard;
++import org.opensearch.index.shard.IndexShardState;
++import org.opensearch.rest.BaseRestHandler;
++import org.opensearch.rest.BytesRestResponse;
++import org.opensearch.rest.RestChannel;
++import org.opensearch.rest.RestRequest;
++import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.node.NodeContext;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
++import org.opensearch.serverless.restcore.RestReplies;
++import org.opensearch.transport.client.node.NodeClient;
++
++import java.io.IOException;
++import java.security.Principal;
++import java.util.List;
++import java.util.function.Supplier;
++
++/** Observes a real foreground write after writer takeover, without opening a shard or writing a probe document. */
++public final class WriterSuccessorHandler extends BaseRestHandler {
++    private final NodeContext node;
++    private final Supplier<Principal> principal;
++    private final String reader;
++
++    public WriterSuccessorHandler(NodeContext node, Supplier<Principal> principal, String reader) {
++        this.node = node;
++        this.principal = principal;
++        this.reader = reader;
++    }
++
++    @Override
++    public String getName() {
++        return "serverless_writer_successor";
++    }
++
++    @Override
++    public List<Route> routes() {
++        return List.of(new Route(RestRequest.Method.GET, "/_serverless/writer_successor/{node_id}/{ephemeral_id}"));
++    }
++
++    @Override
++    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
++        final String nodeId = request.param("node_id");
++        final String ephemeralId = request.param("ephemeral_id");
++        final String index = request.param("index");
++        final String uuid = request.param("index_uuid");
++        final int shard = request.paramAsInt("shard", -1);
++        final long previousTerm = request.paramAsLong("previous_term", -1L);
++        final Principal caller = principal.get();
++        if (caller == null
++            || NamedPrincipal.UNAUTHENTICATED.getName().equals(caller.getName())
++            || reader.equals(caller.getName()) == false
++            || node.httpServerTransport instanceof SecureNetty4HttpServerTransport == false) {
++            return channel -> error(
++                channel,
++                RestStatus.FORBIDDEN,
++                "not_permitted",
++                "writer successor evidence requires the HTTPS handoff reader"
++            );
++        }
++        if (WriterHandoffReceiptStore.isProcessId(nodeId) == false
++            || WriterHandoffReceiptStore.isProcessId(ephemeralId) == false
++            || WriterHandoffReceiptStore.isProcessId(uuid) == false
++            || index == null
++            || index.isEmpty()
++            || index.length() > 255
++            || index.startsWith("#bucket#")
++            || shard < 0
++            || previousTerm < 1L) {
++            return channel -> error(
++                channel,
++                RestStatus.BAD_REQUEST,
++                "invalid_writer_successor_target",
++                "a process and exact independent shard are required"
++            );
++        }
++        final var metadata = node.metadataPlane();
++        if (node.isStarted() == false || metadata == null) {
++            return WriterSuccessorHandler::unavailable;
++        }
++        final var local = node.localNode();
++        if (nodeId.equals(local.getId()) == false || ephemeralId.equals(local.getEphemeralId()) == false) {
++            return channel -> error(channel, RestStatus.CONFLICT, "observer_process_changed", "target does not identify this Java process");
++        }
++        final ShardId shardId = new ShardId(index, uuid, shard);
++        return channel -> node.threadPool().generic().execute(new AbstractRunnable() {
++            @Override
++            protected void doRun() throws IOException {
++                observe(channel, metadata, shardId, previousTerm, nodeId, ephemeralId);
++            }
++
++            @Override
++            public void onFailure(Exception failure) {
++                try {
++                    unavailable(channel);
++                } catch (IOException responseFailure) {
++                    RestReplies.logResponseFailure(logger, getName(), responseFailure);
++                }
++            }
++        });
++    }
++
++    private void observe(RestChannel channel, MetadataPlane metadata, ShardId shardId, long previousTerm, String nodeId, String ephemeralId)
++        throws IOException {
++        final IndexShard writer = node.reconciler().writerShard(shardId);
++        final long term = writer == null ? -1L : writer.getOperationPrimaryTerm();
++        if (term <= previousTerm || writerCurrent(metadata, shardId, writer, term) == false) {
++            pending(channel);
++            return;
++        }
++        final var head = metadata.heads().read(shardId.getIndexName(), shardId.id());
++        if (head.isEmpty()
++            || head.get().term() != term
++            || nodeId.equals(head.get().ownerNodeId()) == false
++            || ephemeralId.equals(head.get().ownerEphemeralId()) == false
++            || shardId.getIndex().getUUID().equals(head.get().indexUuid()) == false
++            || writerCurrent(metadata, shardId, writer, term) == false) {
++            pending(channel);
++            return;
++        }
++        try (var content = channel.newBuilder()) {
++            content.startObject();
++            content.field("version", 1);
++            content.field("node_id", nodeId);
++            content.field("ephemeral_id", ephemeralId);
++            content.field("index", shardId.getIndexName());
++            content.field("index_uuid", shardId.getIndex().getUUID());
++            content.field("shard", shardId.id());
++            content.field("term", term);
++            content.endObject();
++            send(channel, new BytesRestResponse(RestStatus.OK, content));
++        }
++    }
++
++    private boolean writerCurrent(MetadataPlane metadata, ShardId shardId, IndexShard writer, long term) {
++        return node.activation().isWriterTrafficWithdrawn() == false
++            && node.activation().isWriterAdmissionClosed() == false
++            && node.leases().ownershipUnverified() == false
++            && metadata.membership().selfLeaseValidAt(metadata.clock().getAsLong())
++            && node.reconciler().writerShard(shardId) == writer
++            && writer.state() == IndexShardState.STARTED
++            && writer.getOperationPrimaryTerm() == term
++            && node.fences().isWriteFenced(shardId) == false
++            && node.reconciler().hasAcknowledgedWriterWrite(shardId, term);
++    }
++
++    private static void pending(RestChannel channel) throws IOException {
++        error(channel, RestStatus.NOT_FOUND, "writer_successor_pending", "no newer active writer with a foreground write on this process");
++    }
++
++    private static void unavailable(RestChannel channel) throws IOException {
++        error(channel, RestStatus.SERVICE_UNAVAILABLE, "writer_successor_unavailable", "writer successor evidence could not be read");
++    }
++
++    private static void error(RestChannel channel, RestStatus status, String type, String reason) throws IOException {
++        send(channel, RestReplies.error(channel, status, type, reason));
++    }
++
++    private static void send(RestChannel channel, BytesRestResponse response) throws IOException {
++        response.addHeader("Cache-Control", "no-store");
++        channel.sendResponse(response);
++    }
++}
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -229,6 +229,62 @@
+         }
+     }
+ 
++    public void testWriterSuccessorRequiresANewerForegroundWrite() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = plane(clock);
++        final String uuid = "successor-test-uuid";
++        plane.createIndex(new IndexDescriptor("successor", uuid, 1, "{\"properties\":{\"message\":{\"type\":\"keyword\"}}}", null));
++        final var previous = plane.heads().acquire("successor", 0, "old-writer", "old-process", uuid).head();
++        assertEquals(1L, previous.term());
++        plane.heads().release("successor", 0, "old-writer", previous.term());
++        final Settings settings = Settings.builder()
++            .put(nodeSettings("successor-observer"))
++            .put(NodeSettings.WRITER_HANDOFF_READER.getKey(), "receipt-reader")
++            .put("http.type", org.opensearch.transport.Netty4ModulePlugin.NETTY_SECURE_HTTP_TRANSPORT_NAME)
++            .build();
++        try (
++            ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings), new ServerlessTlsTests.TlsPlugin()));
++            HttpClient client = HttpClient.newBuilder().sslContext(ServerlessTlsTests.TlsPlugin.httpClientContext()).build()
++        ) {
++            node.startup().start();
++            node.setMetadataPlane(plane);
++            ready(node, plane, clock);
++            final String base = "https://127.0.0.1:" + node.boundHttpAddress().publishAddress().getPort();
++            final String admin = basic(ADMIN, ADMIN_PASSWORD);
++            final String reader = basic("receipt-reader", "reader-password");
++            final Response created = sendAt(
++                client,
++                "PUT",
++                base + "/_serverless/security/users/receipt-reader",
++                admin,
++                "{\"password\":\"reader-password\"}"
++            );
++            assertEquals(created.body(), 200, created.status());
++            final var local = node.localNode();
++            final String prefix = base + "/_serverless/writer_successor/" + local.getId() + "/";
++            final String lookup = "?index=successor&index_uuid=" + uuid + "&shard=0&previous_term=";
++            final String path = prefix + local.getEphemeralId() + lookup;
++            assertEquals(401, sendAt(client, "GET", path + "1", null, null).status());
++            assertEquals(403, sendAt(client, "GET", path + "1", admin, null).status());
++            assertEquals(409, sendAt(client, "GET", prefix + "wrong-process" + lookup + "1", reader, null).status());
++            assertTrue(node.activation().activateWriter(plane, "successor", 0).isPresent());
++            assertEquals(404, sendAt(client, "GET", path + "1", reader, null).status());
++            final Response write = sendAt(
++                client,
++                "PUT",
++                base + "/successor/_doc/after?refresh=true",
++                admin,
++                "{\"message\":\"after takeover\"}"
++            );
++            assertEquals(write.body(), 201, write.status());
++            final Response observation = sendAt(client, "GET", path + "1", reader, null);
++            assertEquals(observation.body(), 200, observation.status());
++            assertTrue(observation.body(), observation.body().contains("\"term\":2"));
++            assertEquals(404, sendAt(client, "GET", path + "2", reader, null).status());
++            assertEquals(404, sendAt(client, "GET", path.replace(uuid, "another-uuid") + "1", reader, null).status());
++        }
++    }
++
+     public void testWriterWithdrawalViewReportsTheObserverSnapshot() throws Exception {
+         final AtomicLong clock = new AtomicLong(1_000L);
+         final MetadataPlane plane = plane(clock);

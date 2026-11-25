@@ -1,0 +1,17 @@
+**
+!go.mod
+!go.sum
+!api/
+!api/v1alpha1/
+!api/v1alpha1/**
+!internal/
+!internal/java/
+!internal/java/**
+!cmd/
+!cmd/health-probe/
+!cmd/health-probe/**
+!runtime/
+!runtime/Dockerfile
+!runtime/serverless-entrypoint.sh
+!runtime/staged-bundle/
+!runtime/staged-bundle/**

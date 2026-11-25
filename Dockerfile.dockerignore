@@ -1,0 +1,16 @@
+**
+!go.mod
+!go.sum
+!api/
+!api/**
+!cmd/
+!cmd/operator/
+!cmd/operator/**
+!cmd/rollout-proxy-observer/
+!cmd/rollout-proxy-observer/**
+!cmd/rollout-evidence-publisher/
+!cmd/rollout-evidence-publisher/**
+!internal/
+!internal/**
+!pkg/
+!pkg/**

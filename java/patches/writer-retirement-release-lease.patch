@@ -1,0 +1,86 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java b/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java
+@@ -8,6 +8,7 @@
+ 
+ package org.opensearch.serverless.membership;
+ 
++import org.opensearch.common.annotation.InternalApi;
+ import org.opensearch.common.blobstore.BlobContainer;
+ import org.opensearch.common.blobstore.BlobRegister;
+ import org.opensearch.common.blobstore.BlobRegisterCasResult;
+@@ -540,6 +541,16 @@
+      * @throws IOException if the delete fails
+      */
+     public synchronized void release(String nodeId) throws IOException {
++        release(nodeId, true);
++    }
++
++    /** Expires and unenrolls a retiring process without probing optional register reclamation. */
++    @InternalApi
++    public synchronized void releaseForRetirement(String nodeId) throws IOException {
++        release(nodeId, false);
++    }
++
++    private void release(String nodeId, boolean reclaimRegister) throws IOException {
+         final Optional<BlobRegister> index = container.readRegister(MEMBERS);
+         final Optional<BlobRegister> lease = container.readRegister(LEASE_PREFIX + nodeId);
+         if (lease.isPresent()) {
+@@ -565,7 +576,7 @@
+                 container.compareAndSwapRegister(MEMBERS, index.get().generation(), encodeIds(remaining));
+             }
+             // Kept while it names epochs of the node's write log with records not yet published: a successor reads them here.
+-            if (conditionalDeletes.getAsBoolean() && stored.nodeLog().isEmpty()) {
++            if (reclaimRegister && conditionalDeletes.getAsBoolean() && stored.nodeLog().isEmpty()) {
+                 container.deleteRegisterIfUnchanged(LEASE_PREFIX + nodeId, released.currentGeneration());
+             }
+         }
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java b/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
+@@ -457,8 +457,13 @@
+             // Drop the lease rather than let it lapse. Without this a node that shut down cleanly stays
+             // alive to every peer for a full TTL: its shards are unowned and unclaimable that whole time,
+             // because a live lease is never stolen. Releasing is what makes a restart a handover instead
+-            // of a failover, and it costs one delete.
+-            plane.membership().release(node.localNode().getId());
++            // of a failover. Prepared retirement leaves physical reclamation for later.
++            final String nodeId = node.localNode().getId();
++            if (preparedRetirement) {
++                plane.membership().releaseForRetirement(nodeId);
++            } else {
++                plane.membership().release(nodeId);
++            }
+         } catch (Exception e) {
+             logger.warn(
+                 "Lease release failed. Peers will consider this node live until expiry (error_type={})",
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java
+@@ -264,6 +264,26 @@
+         assertEquals(Set.of("node-a"), membership.refresh().stream().map(NodeLease::nodeId).collect(Collectors.toSet()));
+     }
+ 
++    public void testPreparedRetirementExpiresAndUnenrollsWithoutProbingForPhysicalDelete() throws Exception {
++        final AtomicLong now = new AtomicLong(1_000L);
++        final var store = container(createTempDir());
++        final var writer = new BlobLeaseMembership(store, now::get, TTL).conditionalDeletes(() -> {
++            throw new AssertionError("prepared retirement must not probe conditional deletes");
++        });
++        final var peer = new BlobLeaseMembership(store, now::get, TTL);
++        writer.renew(lease("retiring", "ingest"));
++        peer.renew(lease("surviving", "ingest"));
++        assertEquals(Set.of("retiring", "surviving"), peer.enrolledIds());
++
++        writer.releaseForRetirement("retiring");
++
++        final NodeLease expired = peer.read("retiring").orElseThrow();
++        assertTrue(expired.isExpiredAt(now.get()));
++        assertEquals("retiring-eph", expired.ephemeralId());
++        assertEquals(Set.of("surviving"), peer.enrolledIds());
++        assertEquals(List.of("surviving"), peer.refresh().stream().map(NodeLease::nodeId).toList());
++    }
++
+     public void testSubscribersSeeJoinsAndLeaves() throws Exception {
+         final AtomicLong now = new AtomicLong(1_000L);
+         final BlobLeaseMembership membership = new BlobLeaseMembership(container(createTempDir()), now::get, TTL);

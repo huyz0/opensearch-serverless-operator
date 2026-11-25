@@ -1,0 +1,588 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/documents/BulkDispatch.java b/serverless/shell/src/main/java/org/opensearch/serverless/documents/BulkDispatch.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/documents/BulkDispatch.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/documents/BulkDispatch.java
+@@ -216,6 +216,9 @@
+ 
+     /** Takes a shard nobody holds for a batch that needs it; true if this node now writes it. */
+     private static boolean takenHere(NodeContext serving, String index, String uuid, int shard) {
++        if (serving.nodeCapacity().takesWriters() == false) {
++            return false;
++        }
+         try {
+             serving.signals().activate(index, shard).get(ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+         } catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException e) {
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/documents/DocumentWritePlanner.java b/serverless/shell/src/main/java/org/opensearch/serverless/documents/DocumentWritePlanner.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/documents/DocumentWritePlanner.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/documents/DocumentWritePlanner.java
+@@ -503,6 +503,10 @@
+         boolean ownedHere,
+         java.util.function.BiConsumer<org.opensearch.core.action.ActionListener<WriteResult>, ShardId> writeHere
+     ) {
++        if (ownedHere == false && serving.nodeCapacity().takesWriters() == false) {
++            answer.onFailure(DocumentWriteOutcomes.notWriterRefusal(writtenIndex, shard, null));
++            return;
++        }
+         Optional<ShardId> taken = Optional.empty();
+         try {
+             taken = serving.signals().activate(writtenIndex, shard).get(ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/membership/NodeLease.java b/serverless/shell/src/main/java/org/opensearch/serverless/membership/NodeLease.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/membership/NodeLease.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/membership/NodeLease.java
+@@ -36,6 +36,9 @@
+  * {@code BlobLeaseMembership} for what that assumes and does not assume.
+  */
+ public final class NodeLease {
++
++    /** Membership marker for an ingest process still serving its existing writer heads. */
++    public static final String WRITER_TRAFFIC_WITHDRAWN = "writer_traffic_withdrawn";
+ 
+     private final String nodeId;
+     private final String ephemeralId;
+@@ -350,6 +353,26 @@
+      */
+     public Set<String> roles() {
+         return roles;
++    }
++
++    /** The roles reported through client APIs, without internal membership markers. */
++    public Set<String> serviceRoles() {
++        if (writerTrafficWithdrawn() == false) {
++            return roles;
++        }
++        final Set<String> serviceRoles = new LinkedHashSet<>(roles);
++        serviceRoles.remove(WRITER_TRAFFIC_WITHDRAWN);
++        return Set.copyOf(serviceRoles);
++    }
++
++    /** Whether this writer has published assignment withdrawal. */
++    public boolean writerTrafficWithdrawn() {
++        return roles.contains(WRITER_TRAFFIC_WITHDRAWN);
++    }
++
++    /** Whether this member can be selected to take ownership of another shard. */
++    public boolean acceptsNewWriters() {
++        return roles.contains("ingest") && writerTrafficWithdrawn() == false;
+     }
+ 
+     /**
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/FleetPlacement.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/FleetPlacement.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/FleetPlacement.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/FleetPlacement.java
+@@ -16,6 +16,7 @@
+ import java.util.Optional;
+ import java.util.TreeMap;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.util.function.BooleanSupplier;
+ import java.util.function.IntSupplier;
+ import java.util.function.Supplier;
+ 
+@@ -32,6 +33,7 @@
+     private final Supplier<String> localNodeId;
+     private final IntSupplier maxShardsHeld;
+     private final IntSupplier heldShards;
++    private final BooleanSupplier acceptsLocalAssignments;
+ 
+     /**
+      * Creates the placement view of one node.
+@@ -39,11 +41,22 @@
+      * @param localNodeId this node's id, read on every call because the node rebinds it at start
+      * @param maxShardsHeld this node's shard cap
+      * @param heldShards how many shards this node holds now
+-     */
+-    FleetPlacement(Supplier<String> localNodeId, IntSupplier maxShardsHeld, IntSupplier heldShards) {
++     * @param acceptsLocalAssignments whether this node still takes new writer assignments
++     */
++    FleetPlacement(
++        Supplier<String> localNodeId,
++        IntSupplier maxShardsHeld,
++        IntSupplier heldShards,
++        BooleanSupplier acceptsLocalAssignments
++    ) {
+         this.localNodeId = localNodeId;
+         this.maxShardsHeld = maxShardsHeld;
+         this.heldShards = heldShards;
++        this.acceptsLocalAssignments = acceptsLocalAssignments;
++    }
++
++    boolean acceptsNewWriters(NodeLease lease) {
++        return lease.acceptsNewWriters() && (lease.nodeId().equals(localNodeId.get()) == false || acceptsLocalAssignments.getAsBoolean());
+     }
+ 
+     /** The share of a node's cap a fleet sized by {@link #fleetSize} aims to use. */
+@@ -115,7 +128,7 @@
+         for (NodeLease lease : plane.membership().current()) {
+             if (lease.nodeId().equals(localNodeId.get())
+                 || lease.isExpiredAt(now)
+-                || lease.roles().contains(NodeContext.ROLE_INGEST) == false
++                || acceptsNewWriters(lease) == false
+                 || lease.held() < 0
+                 || lease.cap() <= 0) {
+                 continue;
+@@ -188,9 +201,7 @@
+             if (lease.nodeId().equals(deadOwner)) {
+                 deadZone = lease.zone();
+             }
+-            if (lease.nodeId().equals(deadOwner) == false
+-                && lease.isExpiredAt(now) == false
+-                && lease.roles().contains(NodeContext.ROLE_INGEST)) {
++            if (lease.nodeId().equals(deadOwner) == false && lease.isExpiredAt(now) == false && acceptsNewWriters(lease)) {
+                 live.put(lease.nodeId(), lease);
+             }
+         }
+@@ -354,7 +365,7 @@
+         for (NodeLease lease : plane.membership().current()) {
+             if (lease.nodeId().equals(localNodeId.get())
+                 || lease.isExpiredAt(now)
+-                || lease.roles().contains(NodeContext.ROLE_INGEST) == false
++                || acceptsNewWriters(lease) == false
+                 || lease.held() < 0
+                 || lease.held() >= mean) {
+                 continue;
+@@ -403,7 +414,7 @@
+             if (lease.nodeId().equals(localNodeId.get())
+                 || lease.revoked()
+                 || lease.isExpiredAt(now)
+-                || lease.roles().contains(NodeContext.ROLE_INGEST) == false) {
++                || acceptsNewWriters(lease) == false) {
+                 continue;
+             }
+             live.add(lease.nodeId());
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeCapacity.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeCapacity.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeCapacity.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeCapacity.java
+@@ -20,7 +20,8 @@
+         this.placement = new FleetPlacement(
+             () -> node.localNode.getId(),
+             () -> admission.maxShardsHeld(),
+-            () -> node.reconciler == null ? 0 : node.reconciler.heldShards().size()
++            () -> node.reconciler == null ? 0 : node.reconciler.heldShards().size(),
++            this::takesWriters
+         );
+     }
+ 
+@@ -330,7 +331,7 @@
+         org.opensearch.serverless.cluster.IndexDescriptor descriptor,
+         int shard
+     ) {
+-        if (node.roles.contains(NodeContext.ROLE_INGEST)) {
++        if (takesWriters()) {
+             return handOffTarget(plane, descriptor);
+         }
+         if (descriptor.bucket() != null) {
+@@ -342,9 +343,11 @@
+         return placement.writerFor(plane, descriptor.name(), shard);
+     }
+ 
+-    /** Whether this node takes writers; one that does not sends every write on. */
++    /** Whether client routing on this node may choose it for a previously unowned shard. */
+     public boolean takesWriters() {
+-        return node.roles.contains(NodeContext.ROLE_INGEST);
++        return node.roles.contains(NodeContext.ROLE_INGEST)
++            && node.activation().isWriterTrafficWithdrawn() == false
++            && node.activation().isWriterAdmissionClosed() == false;
+     }
+ 
+     /** Where unheld buckets go: the same rendezvous ranking on every node. */
+@@ -370,7 +373,7 @@
+             descriptor.bucket(),
+             plane.membership().current(),
+             plane.clock().getAsLong(),
+-            lease -> lease.roles().contains(NodeContext.ROLE_INGEST)
++            placement::acceptsNewWriters
+         );
+         return owner.filter(id -> id.equals(node.localNode.getId()) == false);
+     }
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java
+@@ -109,6 +109,10 @@
+         final String leaseAddress = advertisedHost.isEmpty()
+             ? node.localNode.getAddress().toString()
+             : advertisedHost + ":" + node.localNode.getAddress().getPort();
++        final var advertisedRoles = new java.util.LinkedHashSet<>(SearchReadiness.of(node).advertised(node.roles));
++        if (node.activation().isWriterTrafficWithdrawn()) {
++            advertisedRoles.add(org.opensearch.serverless.membership.NodeLease.WRITER_TRAFFIC_WITHDRAWN);
++        }
+         plane.membership()
+             .renew(
+                 new org.opensearch.serverless.membership.NodeLease(
+@@ -116,7 +120,7 @@
+                     node.localNode.getEphemeralId(),
+                     leaseAddress,
+                     // Less the search role while the node warms or drains, so no coordinator ranks it as a reader.
+-                    SearchReadiness.of(node).advertised(node.roles),
++                    advertisedRoles,
+                     0L,
+                     node.localNode.getName(),
+                     org.opensearch.Version.CURRENT.toString()
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+@@ -26,7 +26,7 @@
+     private final NodeContext node;
+     private final ReentrantReadWriteLock writerAdmission = new ReentrantReadWriteLock();
+     private volatile boolean writerAdmissionClosed;
+-    private String retirementOperation;
++    private volatile String retirementOperation;
+     private boolean admittedWritersDrained;
+ 
+     WriterActivation(NodeContext node) {
+@@ -88,7 +88,7 @@
+ 
+     /** Whether the JVM has withdrawn client readiness for a writer retirement. */
+     @InternalApi
+-    public synchronized boolean isWriterTrafficWithdrawn() {
++    public boolean isWriterTrafficWithdrawn() {
+         return retirementOperation != null;
+     }
+ 
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/ops/DocumentWrites.java b/serverless/shell/src/main/java/org/opensearch/serverless/ops/DocumentWrites.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/ops/DocumentWrites.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/ops/DocumentWrites.java
+@@ -172,8 +172,14 @@
+         boolean requireAbsent
+     ) throws IOException {
+         Placement placement = routing.place(index, id, customRouting);
+-        if (placement.local() == null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
+-            placement = placeOnceTaken(index, id, customRouting, placement);
++        boolean steered = false;
++        if (placement.local() == null) {
++            if (placement.owner() == null && node.activation().isWriterTrafficWithdrawn()) {
++                placement = steerUnowned(index, placement);
++                steered = true;
++            } else if (placement.owner() == null || placement.owner().equals(node.localNode().getId())) {
++                placement = placeOnceTaken(index, id, customRouting, placement);
++            }
+         }
+         if (placement.local() != null) {
+             final var outcome = deletion
+@@ -184,7 +190,29 @@
+             }
+             return new Written(node.localNode().getId(), outcome, placement.local());
+         }
+-        return forwardWritten(index, id, customRouting, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
++        return forwardWritten(
++            index,
++            id,
++            customRouting,
++            source,
++            refresh,
++            deletion,
++            placement,
++            ifSeqNo,
++            ifPrimaryTerm,
++            requireAbsent,
++            true,
++            steered
++        );
++    }
++
++    private Placement steerUnowned(String index, Placement placement) throws IOException {
++        final var descriptor = routing.describeOnce(index);
++        if (descriptor.isEmpty() || descriptor.get().uuid().equals(placement.uuid()) == false) {
++            return placement;
++        }
++        final var writer = node.nodeCapacity().writerForUnheld(node.metadataPlane(), descriptor.get(), placement.shard());
++        return writer.map(target -> new Placement(null, placement.shard(), target, placement.uuid())).orElse(placement);
+     }
+ 
+     /** How long a write to a shard nobody holds waits for this node to take it; the REST write path waits as long. */
+@@ -267,6 +295,36 @@
+         boolean requireAbsent,
+         boolean mayRetry
+     ) throws IOException {
++        return forwardWritten(
++            index,
++            id,
++            customRouting,
++            source,
++            refresh,
++            deletion,
++            placement,
++            ifSeqNo,
++            ifPrimaryTerm,
++            requireAbsent,
++            mayRetry,
++            false
++        );
++    }
++
++    private Written forwardWritten(
++        String index,
++        String id,
++        String customRouting,
++        String source,
++        boolean refresh,
++        boolean deletion,
++        Placement placement,
++        long ifSeqNo,
++        long ifPrimaryTerm,
++        boolean requireAbsent,
++        boolean mayRetry,
++        boolean steered
++    ) throws IOException {
+         if (placement.owner() == null || placement.owner().equals(node.localNode().getId())) {
+             throw routing.notHere(index, placement);
+         }
+@@ -277,22 +335,20 @@
+                     "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease"
+                 );
+             }
++            final var request = new org.opensearch.serverless.forwarding.ForwardedIndexRequest(
++                index,
++                placement.uuid(),
++                placement.shard(),
++                id,
++                source,
++                refresh,
++                deletion,
++                ifSeqNo,
++                ifPrimaryTerm,
++                requireAbsent
++            ).routing(customRouting);
+             final var ack = org.opensearch.serverless.transport.ShardRouter.of(node)
+-                .forwardIndex(
+-                    peer.get(),
+-                    new org.opensearch.serverless.forwarding.ForwardedIndexRequest(
+-                        index,
+-                        placement.uuid(),
+-                        placement.shard(),
+-                        id,
+-                        source,
+-                        refresh,
+-                        deletion,
+-                        ifSeqNo,
+-                        ifPrimaryTerm,
+-                        requireAbsent
+-                    ).routing(customRouting)
+-                );
++                .forwardIndex(peer.get(), steered ? request.steered() : request);
+             return new Written(
+                 ack.ownerNodeId(),
+                 new org.opensearch.serverless.write.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/CatalogHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/CatalogHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/CatalogHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/CatalogHandler.java
+@@ -181,7 +181,7 @@
+                 builder.field("node_id", lease.nodeId());
+                 builder.field("ephemeral_id", lease.ephemeralId());
+                 builder.field("address", lease.address());
+-                builder.field("roles", lease.roles().stream().sorted().toArray(String[]::new));
++                builder.field("roles", lease.serviceRoles().stream().sorted().toArray(String[]::new));
+                 builder.field("lease_expires_at_millis", lease.expiresAtMillis());
+                 builder.endObject();
+             }
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/NodesHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/NodesHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/NodesHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/NodesHandler.java
+@@ -276,7 +276,7 @@
+     }
+ 
+     private static String[] sorted(NodeLease lease) {
+-        return lease.roles().stream().sorted().toArray(String[]::new);
++        return lease.serviceRoles().stream().sorted().toArray(String[]::new);
+     }
+ 
+     private String clusterName() {
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
+@@ -86,23 +86,31 @@
+         if (nodeId.equals(local.getId()) == false || ephemeralId.equals(local.getEphemeralId()) == false) {
+             return channel -> error(channel, RestStatus.CONFLICT, "writer_process_changed", "target does not identify this Java process");
+         }
+-        if (request.method() == RestRequest.Method.GET) {
+-            return channel -> respond(channel, nodeId, ephemeralId, operation, node.activation().retirementState(operation));
+-        }
+-        if (request.path().startsWith(WITHDRAWAL)) {
+-            return channel -> respond(channel, nodeId, ephemeralId, operation, node.activation().withdrawForRetirement(operation));
+-        }
++        final boolean observing = request.method() == RestRequest.Method.GET;
++        final boolean withdrawing = request.path().startsWith(WITHDRAWAL);
+         return channel -> node.threadPool().generic().execute(new AbstractRunnable() {
+             @Override
+             protected void doRun() throws IOException {
+-                final RetirementState state = node.activation().prepareRetirement(operation);
+-                if (state == RetirementState.OPEN) {
++                final RetirementState state = withdrawing
++                    ? node.activation().withdrawForRetirement(operation)
++                    : node.activation().retirementState(operation);
++                if (state == RetirementState.OPEN && observing == false) {
+                     error(
+                         channel,
+                         RestStatus.CONFLICT,
+                         "writer_traffic_not_withdrawn",
+                         "reserve writer traffic withdrawal before preparation"
+                     );
++                } else if (state == RetirementState.WITHDRAWN) {
++                    // The lease timer owns publication and is quiesced before shutdown releases membership.
++                    if (hasPublishedWithdrawal(node.metadataPlane(), nodeId, ephemeralId) == false) {
++                        unavailable(channel);
++                        return;
++                    }
++                    final RetirementState result = observing || withdrawing
++                        ? node.activation().retirementState(operation)
++                        : node.activation().prepareRetirement(operation);
++                    respond(channel, nodeId, ephemeralId, operation, result);
+                 } else {
+                     respond(channel, nodeId, ephemeralId, operation, state);
+                 }
+@@ -117,6 +125,18 @@
+                 }
+             }
+         });
++    }
++
++    private static boolean hasPublishedWithdrawal(org.opensearch.serverless.metadata.MetadataPlane plane, String nodeId, String ephemeralId)
++        throws IOException {
++        return plane.membership()
++            .read(nodeId)
++            .filter(
++                lease -> lease.ephemeralId().equals(ephemeralId)
++                    && lease.isExpiredAt(plane.clock().getAsLong()) == false
++                    && lease.writerTrafficWithdrawn()
++            )
++            .isPresent();
+     }
+ 
+     private static void respond(RestChannel channel, String nodeId, String ephemeralId, String operation, RetirementState state)
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -287,9 +287,18 @@
+ 
+             assertEquals(409, sendAt(client, "POST", path, preparer, null).status());
+             assertEquals(403, sendAt(client, "POST", withdrawal + "/operation-a", admin, null).status());
++            assertEquals(503, sendAt(client, "POST", withdrawal + "/operation-a", preparer, null).status());
++            assertEquals(503, sendAt(client, "GET", path, preparer, null).status());
++            assertEquals(503, sendAt(client, "POST", path, preparer, null).status());
++            assertFalse(node.activation().isWriterAdmissionClosed());
++            node.leases().renewLease(plane);
+             final Response withdrawn = sendAt(client, "POST", withdrawal + "/operation-a", preparer, null);
+             assertEquals(withdrawn.body(), 200, withdrawn.status());
+             assertTrue(withdrawn.body(), withdrawn.body().contains("\"state\":\"withdrawn\""));
++            final var lease = plane.membership().read(process.getId()).orElseThrow();
++            assertEquals(process.getEphemeralId(), lease.ephemeralId());
++            assertTrue(lease.serviceRoles().contains("ingest"));
++            assertFalse(lease.acceptsNewWriters());
+             assertEquals(withdrawn.body(), sendAt(client, "GET", path, preparer, null).body());
+             assertEquals(withdrawn.body(), sendAt(client, "POST", withdrawal + "/operation-a", preparer, null).body());
+             assertEquals(409, sendAt(client, "POST", withdrawal + "/operation-b", preparer, null).status());
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessForwardingTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessForwardingTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessForwardingTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessForwardingTests.java
+@@ -11,13 +11,17 @@
+ import org.opensearch.common.blobstore.BlobPath;
+ import org.opensearch.common.blobstore.fs.FsBlobStore;
+ import org.opensearch.common.settings.Settings;
++import org.opensearch.common.unit.TimeValue;
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.indices.SystemIndexDescriptor;
+ import org.opensearch.plugins.Plugin;
+ import org.opensearch.plugins.SystemIndexPlugin;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
++import org.opensearch.serverless.cluster.Rendezvous;
+ import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.node.WriterActivation.RetirementState;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
++import org.opensearch.serverless.reconcile.ReconcileScheduler;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.test.OpenSearchTestCase;
+ 
+@@ -195,6 +199,96 @@
+             } finally {
+                 clients.shutdownNow();
+             }
++        }
++    }
++
++    public void testWithdrawnWriterIsSkippedForColdShardsButStillReceivesOwnedWrites() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final var store = new FsBlobStore(1024, createTempDir(), false);
++        final var primary = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
++        final var alpha = new IndexDescriptor("alpha", "uuid-alpha", 2, MAPPING, null);
++        primary.createIndex(alpha);
++        try (
++            Pair pair = new Pair(
++                new ServerlessNode(nodeSettings("surviving-writer")),
++                new ServerlessNode(nodeSettings("withdrawing-writer")),
++                primary,
++                clock
++            );
++            ServerlessNode coordinator = new ServerlessNode(
++                Settings.builder().put(nodeSettings("coordinator")).put("serverless.roles", "search").build()
++            )
++        ) {
++            pair.loopA.setDemandDrivenActivation(true);
++            pair.loopB.setDemandDrivenActivation(true);
++            final var cold = new IndexDescriptor("cold", "uuid-cold", 1, MAPPING, null);
++            primary.createIndex(cold);
++            primary.createIndex(new IndexDescriptor("bulk", "uuid-bulk", 1, MAPPING, null));
++            primary.createIndex(new IndexDescriptor("upsert", "uuid-upsert", 1, MAPPING, null));
++            final String a = pair.a.localNode().getId();
++            final String b = pair.b.localNode().getId();
++            final String victim = Rendezvous.owner("cold/0", List.of(a, b));
++            final boolean withdrawingA = victim.equals(a);
++            final ServerlessNode withdrawing = withdrawingA ? pair.a : pair.b;
++            final ServerlessNode surviving = withdrawingA ? pair.b : pair.a;
++            final String survivor = surviving.localNode().getId();
++            final int retainedShard = withdrawingA ? 0 : 1;
++
++            coordinator.startup().start();
++            final var before = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
++            before.membership().refresh();
++            assertEquals(victim, coordinator.nodeCapacity().writerForUnheld(before, cold, 0).orElseThrow());
++            assertEquals(RetirementState.WITHDRAWN, withdrawing.activation().withdrawForRetirement("retire-writer"));
++            withdrawing.leases().renewLease(primary);
++
++            final var observed = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
++            coordinator.setMetadataPlane(observed);
++            observed.membership().refresh();
++            assertEquals(survivor, coordinator.nodeCapacity().writerForUnheld(observed, cold, 0).orElseThrow());
++            assertEquals(survivor, coordinator.nodeCapacity().takeoverWinner(observed, "alpha", 1, "departed").orElseThrow());
++            final BackgroundReconciler survivingLoop = withdrawingA ? pair.loopB : pair.loopA;
++            final TimeValue interval = TimeValue.timeValueHours(1);
++            try (
++                ReconcileScheduler scheduler = new ReconcileScheduler(
++                    survivingLoop,
++                    surviving.threadPool(),
++                    clock::get,
++                    interval,
++                    interval,
++                    null
++                )
++            ) {
++                surviving.setSignals(scheduler);
++                scheduler.start();
++                final Response coldWrite = send(coordinator, "PUT", "/cold/_doc/first", "{\"msg\":\"new\"}");
++                assertEquals(coldWrite.body(), 201, coldWrite.status());
++                assertEquals(survivor, primary.heads().read("cold", 0).orElseThrow().ownerNodeId());
++
++                final Response bulk = send(
++                    withdrawing,
++                    "POST",
++                    "/_bulk",
++                    "{\"index\":{\"_index\":\"bulk\",\"_id\":\"first\"}}\n{\"msg\":\"new\"}\n"
++                );
++                assertEquals(bulk.body(), 200, bulk.status());
++                assertTrue(bulk.body(), bulk.body().contains("\"status\":201"));
++                assertEquals(survivor, primary.heads().read("bulk", 0).orElseThrow().ownerNodeId());
++
++                final Response upsert = send(
++                    withdrawing,
++                    "POST",
++                    "/upsert/_update/first",
++                    "{\"doc\":{\"msg\":\"new\"},\"doc_as_upsert\":true}"
++                );
++                assertEquals(upsert.body(), 201, upsert.status());
++                assertEquals(survivor, primary.heads().read("upsert", 0).orElseThrow().ownerNodeId());
++            }
++
++            assertEquals(RetirementState.CLOSED, withdrawing.activation().prepareRetirement("retire-writer"));
++            final Response ownedWrite = send(surviving, "PUT", "/alpha/_doc/" + idRoutingTo(alpha, retainedShard), "{\"msg\":\"owned\"}");
++            assertEquals(ownedWrite.body(), 201, ownedWrite.status());
++            assertTrue(ownedWrite.body(), ownedWrite.body().contains(victim));
++            assertEquals(victim, primary.heads().read("alpha", retainedShard).orElseThrow().ownerNodeId());
+         }
+     }
+ 

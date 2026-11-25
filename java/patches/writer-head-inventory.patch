@@ -1,0 +1,489 @@
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHead.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHead.java
+@@ -275,6 +275,15 @@
+      * @throws IOException if the bytes are not a well-formed head
+      */
+     public static ShardHead fromStream(InputStream input) throws IOException {
++        return fromStream(input, false);
++    }
++
++    // A scan must distinguish an explicitly unowned head from damaged ownership metadata.
++    static ShardHead fromInventoryStream(InputStream input) throws IOException {
++        return fromStream(input, true);
++    }
++
++    private static ShardHead fromStream(InputStream input, boolean requireExplicitOwner) throws IOException {
+         try (
+             XContentParser parser = XContentType.JSON.xContent()
+                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, input)
+@@ -286,6 +295,8 @@
+             String uuid = null;
+             String owner = null;
+             String ephemeral = null;
++            boolean sawOwner = false;
++            boolean sawEphemeral = false;
+             final List<String> writers = new ArrayList<>();
+             int shard = -1;
+             long term = 0;
+@@ -295,6 +306,15 @@
+             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                 if (token == null) {
+                     throw new IOException("malformed metadata record: missing end of object");
++                }
++                if (requireExplicitOwner && token != XContentParser.Token.FIELD_NAME) {
++                    if ("owner_node_id".equals(field)) {
++                        requireOwnerField(token, sawOwner);
++                        sawOwner = true;
++                    } else if ("owner_ephemeral_id".equals(field)) {
++                        requireOwnerField(token, sawEphemeral);
++                        sawEphemeral = true;
++                    }
+                 }
+                 if (token == XContentParser.Token.FIELD_NAME) {
+                     field = parser.currentName();
+@@ -325,7 +345,20 @@
+             if (index == null || shard < 0 || term < 1) {
+                 throw new IOException("malformed shard head: missing a required field");
+             }
++            if (requireExplicitOwner
++                && (sawOwner == false
++                    || (owner != null && owner.isBlank())
++                    || (ephemeral != null && (owner == null || ephemeral.isBlank()))
++                    || parser.nextToken() != null)) {
++                throw new IOException("malformed shard head: invalid ownership or trailing content");
++            }
+             return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid).withWriters(writers);
++        }
++    }
++
++    private static void requireOwnerField(XContentParser.Token token, boolean seen) throws IOException {
++        if (seen || (token != XContentParser.Token.VALUE_STRING && token != XContentParser.Token.VALUE_NULL)) {
++            throw new IOException("malformed shard head: invalid or repeated owner field");
+         }
+     }
+ 
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+@@ -8,6 +8,7 @@
+ 
+ package org.opensearch.serverless.metadata;
+ 
++import org.opensearch.common.annotation.InternalApi;
+ import org.opensearch.common.blobstore.BlobContainer;
+ import org.opensearch.common.blobstore.BlobRegister;
+ import org.opensearch.common.blobstore.BlobRegisterCasResult;
+@@ -42,6 +43,8 @@
+  */
+ public final class ShardHeadStore {
+ 
++    private static final String BUCKET_HEAD_PREFIX = "#bucket#";
++    private static final int MAX_SCAN_PAGE = 128;
+     private final ConditionalBlobContainer container;
+     private final LongSupplier clock;
+     private final long leaseTtlMillis;
+@@ -81,7 +84,7 @@
+ 
+     /** The index name a bucket's head is recorded under: never a valid index name, so it cannot collide with one. */
+     public static String bucketHeadIndex(String bucketId) {
+-        return "#bucket#" + bucketId;
++        return BUCKET_HEAD_PREFIX + bucketId;
+     }
+ 
+     /** Where a shard's ownership is recorded, and for a member, how to show the bucket head as the member's own. */
+@@ -181,6 +184,73 @@
+             return Optional.empty();
+         }
+         return Optional.of(ref.shown(parse(register.get())));
++    }
++
++    /** One physical head, with its bucket identity when ownership is shared across members. */
++    @InternalApi
++    public record OwnedHead(String key, String bucketId, ShardHead head) {
++    }
++
++    /** A page of observations and the exclusive cursor for the next page, or null at the end. */
++    @InternalApi
++    public record OwnedHeadPage(List<OwnedHead> heads, String nextAfter) {
++        public OwnedHeadPage {
++            heads = List.copyOf(heads);
++        }
++    }
++
++    /**
++     * Walks physical registers, including bucket heads, without consulting local writers or assignment hints.
++     * Heads with a matching node ID and absent ephemeral ID are returned as ambiguous legacy ownership.
++     * A multi-page scan is not an atomic snapshot. To inventory a process, first stop its new writer acquisitions.
++     */
++    @InternalApi
++    public OwnedHeadPage scanOwnedHeads(String nodeId, String ephemeralId, String after, int limit) throws IOException {
++        if (nodeId == null || nodeId.isBlank() || ephemeralId == null || ephemeralId.isBlank() || limit < 1 || limit > MAX_SCAN_PAGE) {
++            throw new IllegalArgumentException("writer head scan requires process IDs and a bounded page size");
++        }
++        final var names = container.listBlobsByPrefix(null, after, limit + 1);
++        final var owned = new ArrayList<OwnedHead>();
++        final int count = Math.min(names.size(), limit);
++        for (int i = 0; i < count; i++) {
++            final var listed = names.get(i);
++            final String key = listed.name();
++            if (listed.length() == 0) {
++                throw new IOException("empty physical writer head");
++            }
++            final var register = container.readRegister(key);
++            if (register.isEmpty()) {
++                if (container.blobExists(key)) {
++                    throw new IOException("a listed writer head did not contain a readable register");
++                }
++                continue;
++            }
++            final ShardHead head;
++            try (InputStream input = register.get().value().streamInput()) {
++                head = ShardHead.fromInventoryStream(input);
++            } catch (RuntimeException malformed) {
++                throw new IOException("could not decode a physical writer head", malformed);
++            }
++            if (head.indexName().isEmpty() || key.equals(RegisterMap.shardHeadBlob(head.indexName(), head.shardId())) == false) {
++                throw new IOException("physical writer head identity does not match its register");
++            }
++            final String bucketId = bucketIdOf(head);
++            if (nodeId.equals(head.ownerNodeId()) && (head.ownerEphemeralId() == null || ephemeralId.equals(head.ownerEphemeralId()))) {
++                owned.add(new OwnedHead(key, bucketId, head));
++            }
++        }
++        return new OwnedHeadPage(owned, names.size() > limit ? names.get(limit - 1).name() : null);
++    }
++
++    private static String bucketIdOf(ShardHead head) throws IOException {
++        if (head.indexName().startsWith(BUCKET_HEAD_PREFIX) == false) {
++            return null;
++        }
++        final String bucketId = head.indexName().substring(BUCKET_HEAD_PREFIX.length());
++        if (head.shardId() != 0 || head.indexUuid() != null || bucketId.isBlank()) {
++            throw new IOException("invalid physical bucket writer head");
++        }
++        return bucketId;
+     }
+ 
+     /**
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/WriterHandoffReceiptStore.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/WriterHandoffReceiptStore.java
+@@ -151,12 +151,13 @@
+     }
+ 
+     private static String key(String nodeId, String ephemeralId) {
+-        if (nodeId == null
+-            || PROCESS_ID.matcher(nodeId).matches() == false
+-            || ephemeralId == null
+-            || PROCESS_ID.matcher(ephemeralId).matches() == false) {
++        if (isProcessId(nodeId) == false || isProcessId(ephemeralId) == false) {
+             throw new IllegalArgumentException("writer handoff receipt requires exact node and ephemeral process IDs");
+         }
+         return nodeId + "." + ephemeralId;
+     }
++
++    public static boolean isProcessId(String id) {
++        return id != null && PROCESS_ID.matcher(id).matches();
++    }
+ }
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterHandoffReceiptHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterHandoffReceiptHandler.java
+@@ -28,8 +28,10 @@
+ import java.util.Optional;
+ import java.util.function.Supplier;
+ 
+-/** Serves an exact process's durable writer receipt to the configured identity. */
++/** Serves durable writer evidence to the configured identity. */
+ public final class WriterHandoffReceiptHandler extends BaseRestHandler {
++    private static final String HEADS_PATH = "/_serverless/writer_heads/";
++    private static final int HEAD_SCAN_PAGE = 32;
+     private final Supplier<MetadataPlane> plane;
+     private final ThreadPool threadPool;
+     private final Supplier<Principal> principal;
+@@ -49,33 +51,53 @@
+ 
+     @Override
+     public List<Route> routes() {
+-        return List.of(new Route(RestRequest.Method.GET, "/_serverless/writer_handoffs/{node_id}/{ephemeral_id}"));
++        return List.of(
++            new Route(RestRequest.Method.GET, "/_serverless/writer_handoffs/{node_id}/{ephemeral_id}"),
++            new Route(RestRequest.Method.GET, HEADS_PATH + "{node_id}/{ephemeral_id}")
++        );
+     }
+ 
+     @Override
+     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
+         final String nodeId = request.param("node_id");
+         final String ephemeralId = request.param("ephemeral_id");
++        final boolean scanHeads = request.path().startsWith(HEADS_PATH);
++        final String after = scanHeads ? request.param("after") : null;
+         final Principal caller = principal.get();
+         if (caller == null
+             || NamedPrincipal.UNAUTHENTICATED.getName().equals(caller.getName())
+             || reader.equals(caller.getName()) == false) {
+             return channel -> error(channel, RestStatus.FORBIDDEN, "not_permitted", "caller is not the configured writer handoff reader");
+         }
++        if (WriterHandoffReceiptStore.isProcessId(nodeId) == false || WriterHandoffReceiptStore.isProcessId(ephemeralId) == false) {
++            return channel -> error(
++                channel,
++                RestStatus.BAD_REQUEST,
++                "invalid_process_identity",
++                "valid node and ephemeral IDs are required"
++            );
++        }
++        if (after != null && (after.isEmpty() || after.length() > 1024 || after.chars().anyMatch(Character::isISOControl))) {
++            return channel -> error(channel, RestStatus.BAD_REQUEST, "invalid_head_cursor", "a valid writer head cursor is required");
++        }
+         final MetadataPlane metadata = plane.get();
+         if (metadata == null) {
+-            return channel -> unavailable(channel);
++            return channel -> unavailable(channel, scanHeads);
+         }
+         return channel -> threadPool.generic().execute(new AbstractRunnable() {
+             @Override
+             protected void doRun() throws IOException {
+-                read(channel, metadata, nodeId, ephemeralId);
++                if (scanHeads) {
++                    readOwnedHeads(channel, metadata, nodeId, ephemeralId, after);
++                } else {
++                    read(channel, metadata, nodeId, ephemeralId);
++                }
+             }
+ 
+             @Override
+             public void onFailure(Exception failure) {
+                 try {
+-                    unavailable(channel);
++                    unavailable(channel, scanHeads);
+                 } catch (IOException responseFailure) {
+                     RestReplies.logResponseFailure(logger, getName(), responseFailure);
+                 }
+@@ -85,13 +107,7 @@
+ 
+     private static void read(RestChannel channel, MetadataPlane metadata, String nodeId, String ephemeralId) throws IOException {
+         final var receipts = new WriterHandoffReceiptStore(metadata.blobStore(), BlobPath.cleanPath());
+-        final Optional<WriterHandoffReport> receipt;
+-        try {
+-            receipt = receipts.read(nodeId, ephemeralId);
+-        } catch (IllegalArgumentException invalidIdentity) {
+-            error(channel, RestStatus.BAD_REQUEST, "invalid_process_identity", "valid node and ephemeral IDs are required");
+-            return;
+-        }
++        final Optional<WriterHandoffReport> receipt = receipts.read(nodeId, ephemeralId);
+         if (receipt.isEmpty()) {
+             error(channel, RestStatus.NOT_FOUND, "writer_handoff_receipt_missing", "no receipt exists for this process");
+             return;
+@@ -120,8 +136,46 @@
+         }
+     }
+ 
+-    private static void unavailable(RestChannel channel) throws IOException {
+-        error(channel, RestStatus.SERVICE_UNAVAILABLE, "writer_handoff_receipt_unavailable", "writer handoff receipt could not be read");
++    private static void readOwnedHeads(RestChannel channel, MetadataPlane metadata, String nodeId, String ephemeralId, String after)
++        throws IOException {
++        final var page = metadata.heads().scanOwnedHeads(nodeId, ephemeralId, after, HEAD_SCAN_PAGE);
++        try (var content = channel.newBuilder()) {
++            content.startObject();
++            content.field("version", 1);
++            content.field("node_id", nodeId);
++            content.field("ephemeral_id", ephemeralId);
++            content.field("after", after);
++            content.field("next_after", page.nextAfter());
++            content.startArray("heads");
++            for (var entry : page.heads()) {
++                final var head = entry.head();
++                content.startObject();
++                content.field("key", entry.key());
++                content.field("bucket_id", entry.bucketId());
++                content.field("index", head.indexName());
++                content.field("index_uuid", head.indexUuid());
++                content.field("shard", head.shardId());
++                content.field("term", head.term());
++                content.field("owner_ephemeral_id", head.ownerEphemeralId());
++                content.endObject();
++            }
++            content.endArray();
++            content.endObject();
++            send(channel, new BytesRestResponse(RestStatus.OK, content));
++        }
++    }
++
++    private static void unavailable(RestChannel channel, boolean scanHeads) throws IOException {
++        if (scanHeads) {
++            error(channel, RestStatus.SERVICE_UNAVAILABLE, "writer_head_inventory_unavailable", "writer head inventory could not be read");
++        } else {
++            error(
++                channel,
++                RestStatus.SERVICE_UNAVAILABLE,
++                "writer_handoff_receipt_unavailable",
++                "writer handoff receipt could not be read"
++            );
++        }
+     }
+ 
+     private static void error(RestChannel channel, RestStatus status, String type, String reason) throws IOException {
+--- /dev/null
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHeadInventoryTests.java
+@@ -0,0 +1,103 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ */
++package org.opensearch.serverless.testkit;
++
++import org.opensearch.common.blobstore.BlobPath;
++import org.opensearch.common.blobstore.ConditionalBlobContainer;
++import org.opensearch.common.blobstore.fs.FsBlobStore;
++import org.opensearch.core.common.bytes.BytesArray;
++import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.metadata.RegisterMap;
++import org.opensearch.serverless.metadata.ShardHead;
++import org.opensearch.serverless.metadata.ShardHeadStore;
++import org.opensearch.test.OpenSearchTestCase;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++public class WriterHeadInventoryTests extends OpenSearchTestCase {
++    public void testFindsPhysicalHeadsWithoutLocalStateAndSeparatesOtherIncarnations() throws Exception {
++        try (var storage = new FsBlobStore(8192, createTempDir(), false)) {
++            final BlobPath base = BlobPath.cleanPath();
++            final var plane = new MetadataPlane(storage, base, () -> 1_000L, 30_000L);
++            final var container = ConditionalBlobContainer.of(storage.blobContainer(RegisterMap.shards(base)));
++            put(container, new ShardHead("cold", 2, 7L, "node", "process", 2_000L, "uuid-cold"));
++            put(container, new ShardHead(ShardHeadStore.bucketHeadIndex("bucket-a"), 0, 8L, "node", "process", 2_000L));
++            assertTrue(
++                container.createRegisterIfAbsent(
++                    RegisterMap.shardHeadBlob("legacy", 0),
++                    new BytesArray("{\"index\":\"legacy\",\"shard\":0,\"term\":6,\"owner_node_id\":\"node\"}")
++                ).applied()
++            );
++            put(container, new ShardHead("new-process", 1, 9L, "node", "replacement", 2_000L, "uuid-replacement"));
++            put(container, new ShardHead("other-node", 0, 4L, "other", "process", 2_000L, "uuid-other"));
++            put(container, new ShardHead("released", 0, 3L, null, null, 0L, "uuid-released"));
++
++            String after = null;
++            final var found = new ArrayList<ShardHeadStore.OwnedHead>();
++            int pages = 0;
++            int emptyPages = 0;
++            do {
++                final var page = plane.heads().scanOwnedHeads("node", "process", after, 1);
++                assertTrue("cursor did not advance", ++pages <= 6);
++                found.addAll(page.heads());
++                if (page.heads().isEmpty()) {
++                    emptyPages++;
++                }
++                after = page.nextAfter();
++            } while (after != null);
++            assertEquals(6, pages);
++            assertEquals(3, emptyPages);
++            assertEquals(
++                Set.of("cold", "legacy", ShardHeadStore.bucketHeadIndex("bucket-a")),
++                found.stream().map(head -> head.head().indexName()).collect(Collectors.toSet())
++            );
++            assertEquals(3, found.size());
++            final var bucket = found.stream().filter(head -> head.bucketId() != null).findFirst().orElseThrow();
++            assertEquals("bucket-a", bucket.bucketId());
++            assertEquals(8L, bucket.head().term());
++            final var legacy = found.stream().filter(head -> head.head().indexName().equals("legacy")).findFirst().orElseThrow();
++            assertNull(legacy.head().ownerEphemeralId());
++        }
++    }
++
++    public void testInventoryRefusesCorruptRegisters() throws Exception {
++        final var directory = createTempDir();
++        try (var storage = new FsBlobStore(8192, directory, false)) {
++            final String prefix = "{\"index\":\"broken\",\"shard\":0,\"term\":7,";
++            final List<String> invalid = List.of(
++                "broken",
++                prefix + "\"owner_ephemeral_id\":\"process\"}",
++                prefix + "\"owner_node_id\":{},\"owner_ephemeral_id\":\"process\"}",
++                prefix + "\"owner_node_id\":null,\"owner_ephemeral_id\":\"process\"}"
++            );
++            for (int i = 0; i < invalid.size(); i++) {
++                final BlobPath base = BlobPath.cleanPath().add(Integer.toString(i));
++                final var plane = new MetadataPlane(storage, base, () -> 1_000L, 30_000L);
++                final var container = ConditionalBlobContainer.of(storage.blobContainer(RegisterMap.shards(base)));
++                assertTrue(
++                    container.createRegisterIfAbsent(RegisterMap.shardHeadBlob("broken", 0), new BytesArray(invalid.get(i))).applied()
++                );
++                expectThrows(IOException.class, () -> plane.heads().scanOwnedHeads("node", "process", null, 32));
++            }
++
++            final BlobPath base = BlobPath.cleanPath().add("empty");
++            final var plane = new MetadataPlane(storage, base, () -> 1_000L, 30_000L);
++            Files.createFile(directory.resolve("empty").resolve("shards").resolve(RegisterMap.shardHeadBlob("broken", 0)));
++            expectThrows(IOException.class, () -> plane.heads().scanOwnedHeads("node", "process", null, 32));
++        }
++    }
++
++    private static void put(ConditionalBlobContainer container, ShardHead head) throws IOException {
++        assertTrue(container.createRegisterIfAbsent(RegisterMap.shardHeadBlob(head.indexName(), head.shardId()), head.toBytes()).applied());
++    }
++}
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -214,6 +214,16 @@
+             assertEquals(503, unreadable.status());
+             assertTrue(unreadable.body(), unreadable.body().contains("writer_handoff_receipt_unavailable"));
+             assertEquals(400, send(node, "GET", "/_serverless/writer_handoffs/writer/bad.id", account, null).status());
++
++            final String headPath = "/_serverless/writer_heads/writer/old-process";
++            assertTrue(plane.heads().acquire("orphan", 2, "writer", "old-process", "uuid-orphan").acquired());
++            assertEquals(401, send(node, "GET", headPath, null, null).status());
++            assertEquals(403, send(node, "GET", headPath, basic(ADMIN, ADMIN_PASSWORD), null).status());
++            final Response inventory = send(node, "GET", headPath, account, null);
++            assertEquals(inventory.body(), 200, inventory.status());
++            assertTrue(inventory.body(), inventory.body().contains("\"index_uuid\":\"uuid-orphan\""));
++            assertTrue(inventory.body(), inventory.body().contains("\"owner_ephemeral_id\":\"old-process\""));
++            assertTrue(inventory.body(), inventory.body().contains("\"next_after\":null"));
+         }
+     }
+ 
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java
+@@ -18,6 +18,8 @@
+ import org.opensearch.core.common.bytes.BytesReference;
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.repositories.s3.MinioBlobStores;
++import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.metadata.ShardHeadStore;
+ import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
+ import org.opensearch.serverless.reconcile.WriterHandoffReport;
+ import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
+@@ -130,6 +132,30 @@
+         }
+     }
+ 
++    public void testPhysicalWriterInventoryResumesAcrossS3Pages() throws Exception {
++        final BlobContainer fixture = newContainer();
++        try (var backing = store()) {
++            final var heads = new MetadataPlane(backing, fixture.path(), () -> 1_000L, 30_000L).heads();
++            assertTrue(heads.acquire("normal", 0, "target", "old-process", "uuid-normal").acquired());
++            assertTrue(heads.acquire("foreign", 0, "target", "new-process", "uuid-foreign").acquired());
++            assertTrue(heads.acquire(ShardHeadStore.bucketHeadIndex("shared"), 0, "target", "old-process").acquired());
++
++            final var found = new java.util.ArrayList<ShardHeadStore.OwnedHead>();
++            String cursor = null;
++            int pages = 0;
++            do {
++                final var page = heads.scanOwnedHeads("target", "old-process", cursor, 1);
++                assertTrue("cursor did not advance", ++pages <= 3);
++                found.addAll(page.heads());
++                cursor = page.nextAfter();
++            } while (cursor != null);
++            assertEquals(3, pages);
++            assertEquals(2, found.size());
++            assertEquals(1L, found.stream().filter(entry -> "shared".equals(entry.bucketId())).count());
++            assertEquals(1L, found.stream().filter(entry -> "uuid-normal".equals(entry.head().indexUuid())).count());
++        }
++    }
++
+     private org.opensearch.common.blobstore.BlobStore lastStore;
+ 
+     @Override

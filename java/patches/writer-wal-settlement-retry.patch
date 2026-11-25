@@ -1,0 +1,161 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+@@ -524,7 +524,10 @@
+         if (current.writers().isEmpty()) {
+             return true;
+         }
+-        return container.compareAndSwapRegister(name, existing.get().generation(), current.withWriters(List.of()).toBytes()).applied();
++        if (container.compareAndSwapRegister(name, existing.get().generation(), current.withWriters(List.of()).toBytes()).applied() == false) {
++            throw new IOException("shard head changed during WAL settlement");
++        }
++        return true;
+     }
+ 
+     /**
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java
+@@ -553,35 +553,23 @@
+     @Override
+     public void replayedAndPublished(ShardId shardId, long term, java.util.concurrent.Callable<Boolean> settle) throws IOException {
+         final java.util.concurrent.Executor background = this.background;
++        final java.util.concurrent.Callable<Boolean> publishAndClear = () -> Boolean.TRUE.equals(settle.call())
++            && clearPredecessorWAL(shardId, term);
+         if (background == null) {
+-            if (settled(shardId, settle, 1)) {
+-                clearPredecessorWAL(shardId, term);
+-            }
++            settled(shardId, publishAndClear, 1);
+             return;
+         }
+         // Off the open: the shard serves as soon as its replay is in, and a head that names the logs a little longer only
+         // has a later successor or a reader read them for nothing.
+         try {
+-            background.execute(() -> {
+-                try {
+-                    if (settled(shardId, settle, SETTLE_ATTEMPTS)) {
+-                        clearPredecessorWAL(shardId, term);
+-                    }
+-                } catch (IOException | RuntimeException e) {
+-                    logger.debug(
+-                        "Could not drop predecessor logs from the shard head (shard={}, error_type={})",
+-                        shardId.id(),
+-                        e.getClass().getSimpleName()
+-                    );
+-                }
+-            });
++            background.execute(() -> settled(shardId, publishAndClear, SETTLE_ATTEMPTS));
+         } catch (RuntimeException e) {
+             // Shutting down: the head keeps naming them, which costs reads, never records.
+         }
+     }
+ 
+-    private void clearPredecessorWAL(ShardId shardId, long term) throws IOException {
+-        plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term, shardId.getIndex().getUUID(), ephemeralId);
++    private boolean clearPredecessorWAL(ShardId shardId, long term) throws IOException {
++        return plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term, shardId.getIndex().getUUID(), ephemeralId);
+     }
+ 
+     /**
+@@ -603,7 +591,7 @@
+             } catch (Exception e) {
+                 if (attempt >= attempts) {
+                     logger.debug(
+-                        "The next publish will retry the shard register (shard={}, error_type={})",
++                        "The writer could not settle predecessor WAL within the retry window (shard={}, error_type={})",
+                         shardId.id(),
+                         e.getClass().getSimpleName()
+                     );
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java
+@@ -8,9 +8,13 @@
+ 
+ package org.opensearch.serverless.testkit;
+ 
++import org.opensearch.common.blobstore.BlobContainer;
+ import org.opensearch.common.blobstore.BlobPath;
++import org.opensearch.common.blobstore.BlobRegisterCasResult;
++import org.opensearch.common.blobstore.BlobStore;
+ import org.opensearch.common.blobstore.fs.FsBlobStore;
+ import org.opensearch.common.settings.Settings;
++import org.opensearch.core.common.bytes.BytesReference;
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.metadata.Acquisition;
+@@ -21,11 +25,13 @@
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.test.OpenSearchTestCase;
+ 
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ /** With one write log per node: a crashed writer's unpublished writes reach whoever takes its shards, and stay there. */
+@@ -96,7 +102,8 @@
+ 
+     public void testACrashedWritersUnpublishedWritesSurviveTwoTakeovers() throws Exception {
+         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+-        final var store = MeterStores.create(createTempDir(), createTempDir());
++        final AtomicBoolean failClear = new AtomicBoolean(true);
++        final var store = failOneWALSettlement(MeterStores.create(createTempDir(), createTempDir()), failClear);
+         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
+ 
+@@ -123,6 +130,14 @@
+                 takeAll(second, plane, clock).published()
+             );
+             assertFound(second, fromFirst);
++            assertBusy(() -> {
++                assertFalse("the fault reached the first attempt to clear the predecessor WAL", failClear.get());
++                for (ShardId shardId : second.reconciler().openShards()) {
++                    final var head = plane.heads().readIndependent(shardId.getIndexName(), shardId.id()).orElseThrow();
++                    assertEquals(second.localNode().getId(), head.ownerNodeId());
++                    assertTrue("a transient failure must not leave the predecessor unsettled", head.writers().isEmpty());
++                }
++            });
+             for (ShardId shardId : second.reconciler().openShards()) {
+                 second.writes().index(shardId, "second-" + shardId.id(), "{\"msg\":\"s\",\"n\":" + shardId.id() + "}");
+             }
+@@ -144,6 +159,35 @@
+             closeQuietly(first);
+             store.close();
+         }
++    }
++
++    private static BlobStore failOneWALSettlement(BlobStore delegate, AtomicBoolean failClear) {
++        return new BlobStore() {
++            @Override
++            public BlobContainer blobContainer(BlobPath path) {
++                final BlobContainer actual = delegate.blobContainer(path);
++                if (path.buildAsString().equals("shards/") == false) {
++                    return actual;
++                }
++                return new DelegatingBlobContainer(actual) {
++                    @Override
++                    public BlobRegisterCasResult compareAndSwapRegister(String name, long generation, BytesReference value)
++                        throws IOException {
++                        final ShardHead head = ShardHead.fromStream(value.streamInput());
++                        if (head.term() > 1L && head.ownerNodeId() != null && head.writers().isEmpty()
++                            && failClear.compareAndSet(true, false)) {
++                            throw new IOException("injected WAL settlement failure");
++                        }
++                        return super.compareAndSwapRegister(name, generation, value);
++                    }
++                };
++            }
++
++            @Override
++            public void close() throws IOException {
++                delegate.close();
++            }
++        };
+     }
+ 
+     public void testShardsLetGoOfCleanlyNeedNoNodeLog() throws Exception {

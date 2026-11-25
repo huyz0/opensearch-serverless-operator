@@ -1,0 +1,24 @@
+# Optional namespaced permissions for development blue/green rollout.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensearch-serverless-rollout
+rules:
+  - apiGroups: ['']
+    resources: [services]
+    verbs: [patch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opensearch-serverless-rollout
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opensearch-serverless-rollout
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-serverless-operator

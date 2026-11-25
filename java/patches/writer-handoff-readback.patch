@@ -1,0 +1,300 @@
+--- /dev/null
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterHandoffReceiptHandler.java
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ */
++package org.opensearch.serverless.rest;
++
++import org.opensearch.common.blobstore.BlobPath;
++import org.opensearch.common.util.concurrent.AbstractRunnable;
++import org.opensearch.core.rest.RestStatus;
++import org.opensearch.identity.NamedPrincipal;
++import org.opensearch.rest.BaseRestHandler;
++import org.opensearch.rest.BytesRestResponse;
++import org.opensearch.rest.RestChannel;
++import org.opensearch.rest.RestRequest;
++import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
++import org.opensearch.serverless.reconcile.WriterHandoffReport;
++import org.opensearch.serverless.restcore.RestReplies;
++import org.opensearch.threadpool.ThreadPool;
++import org.opensearch.transport.client.node.NodeClient;
++
++import java.io.IOException;
++import java.security.Principal;
++import java.util.List;
++import java.util.Optional;
++import java.util.function.Supplier;
++
++/** Serves an exact process's durable writer receipt to the configured identity. */
++public final class WriterHandoffReceiptHandler extends BaseRestHandler {
++    private final Supplier<MetadataPlane> plane;
++    private final ThreadPool threadPool;
++    private final Supplier<Principal> principal;
++    private final String reader;
++
++    public WriterHandoffReceiptHandler(Supplier<MetadataPlane> plane, ThreadPool threadPool, Supplier<Principal> principal, String reader) {
++        this.plane = plane;
++        this.threadPool = threadPool;
++        this.principal = principal;
++        this.reader = reader;
++    }
++
++    @Override
++    public String getName() {
++        return "serverless_writer_handoff_receipt";
++    }
++
++    @Override
++    public List<Route> routes() {
++        return List.of(new Route(RestRequest.Method.GET, "/_serverless/writer_handoffs/{node_id}/{ephemeral_id}"));
++    }
++
++    @Override
++    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
++        final String nodeId = request.param("node_id");
++        final String ephemeralId = request.param("ephemeral_id");
++        final Principal caller = principal.get();
++        if (caller == null
++            || NamedPrincipal.UNAUTHENTICATED.getName().equals(caller.getName())
++            || reader.equals(caller.getName()) == false) {
++            return channel -> error(channel, RestStatus.FORBIDDEN, "not_permitted", "caller is not the configured writer handoff reader");
++        }
++        final MetadataPlane metadata = plane.get();
++        if (metadata == null) {
++            return channel -> unavailable(channel);
++        }
++        return channel -> threadPool.generic().execute(new AbstractRunnable() {
++            @Override
++            protected void doRun() throws IOException {
++                read(channel, metadata, nodeId, ephemeralId);
++            }
++
++            @Override
++            public void onFailure(Exception failure) {
++                try {
++                    unavailable(channel);
++                } catch (IOException responseFailure) {
++                    RestReplies.logResponseFailure(logger, getName(), responseFailure);
++                }
++            }
++        });
++    }
++
++    private static void read(RestChannel channel, MetadataPlane metadata, String nodeId, String ephemeralId) throws IOException {
++        final var receipts = new WriterHandoffReceiptStore(metadata.blobStore(), BlobPath.cleanPath());
++        final Optional<WriterHandoffReport> receipt;
++        try {
++            receipt = receipts.read(nodeId, ephemeralId);
++        } catch (IllegalArgumentException invalidIdentity) {
++            error(channel, RestStatus.BAD_REQUEST, "invalid_process_identity", "valid node and ephemeral IDs are required");
++            return;
++        }
++        if (receipt.isEmpty()) {
++            error(channel, RestStatus.NOT_FOUND, "writer_handoff_receipt_missing", "no receipt exists for this process");
++            return;
++        }
++        final var report = receipt.get();
++        try (var content = channel.newBuilder()) {
++            content.startObject();
++            content.field("version", 1);
++            content.field("node_id", report.nodeId());
++            content.field("ephemeral_id", report.ephemeralId());
++            content.startArray("shards");
++            for (var result : report.shards()) {
++                content.startObject();
++                content.field("index", result.shard().getIndexName());
++                content.field("index_uuid", result.shard().getIndex().getUUID());
++                content.field("shard", result.shard().id());
++                content.field("term", result.term());
++                content.field("hibernated", result.hibernated());
++                content.field("outcome", result.outcome().name());
++                content.field("local_cleanup_complete", result.localCleanupComplete());
++                content.endObject();
++            }
++            content.endArray();
++            content.endObject();
++            send(channel, new BytesRestResponse(RestStatus.OK, content));
++        }
++    }
++
++    private static void unavailable(RestChannel channel) throws IOException {
++        error(channel, RestStatus.SERVICE_UNAVAILABLE, "writer_handoff_receipt_unavailable", "writer handoff receipt could not be read");
++    }
++
++    private static void error(RestChannel channel, RestStatus status, String type, String reason) throws IOException {
++        send(channel, RestReplies.error(channel, status, type, reason));
++    }
++
++    private static void send(RestChannel channel, BytesRestResponse response) {
++        response.addHeader("Cache-Control", "no-store");
++        channel.sendResponse(response);
++    }
++}
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeSettings.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeSettings.java
+@@ -76,6 +76,12 @@
+         "serverless.writer_handoff.persist_on_shutdown",
+         false,
+         Property.NodeScope
++    );
++
++    public static final Setting<String> WRITER_HANDOFF_READER = Setting.simpleString(
++        "serverless.writer_handoff.reader",
++        "",
++        Setting.Property.NodeScope
+     );
+ 
+     /**
+@@ -167,6 +173,7 @@
+             TRANSPORT_ADVERTISE_HOST,
+             LEASE_TTL_MILLIS,
+             PERSIST_WRITER_HANDOFF,
++            WRITER_HANDOFF_READER,
+             HEAD_VERIFY_INTERVAL_MILLIS,
+             DESCRIPTOR_REFRESH_INTERVAL_MILLIS,
+             JANITOR_INTERVAL_MILLIS,
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
+@@ -9,13 +9,16 @@
+ 
+ import org.opensearch.cluster.ClusterName;
+ import org.opensearch.common.settings.ClusterSettings;
++import org.opensearch.plugins.IdentityPlugin;
+ import org.opensearch.rest.RestController;
+ import org.opensearch.rest.RestHandler;
++import org.opensearch.serverless.node.NodeSettings;
+ import org.opensearch.serverless.node.SearchReadiness;
+ import org.opensearch.serverless.plugins.PluginActions;
+ import org.opensearch.serverless.plugins.PluginInjector;
+ import org.opensearch.serverless.rest.ServerlessHealthHandler;
+ import org.opensearch.serverless.rest.ServerlessRootHandler;
++import org.opensearch.serverless.rest.WriterHandoffReceiptHandler;
+ import org.opensearch.serverless.warm.SearchDrain;
+ import org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry;
+ import org.opensearch.usage.UsageService;
+@@ -96,6 +99,19 @@
+             guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> node.metadataPlane(), () -> node))
+         );
+         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> node, () -> node.metadataPlane())));
++        final String handoffReader = NodeSettings.WRITER_HANDOFF_READER.get(node.settings());
++        if (handoffReader.isBlank() == false && node.plugins().filter(IdentityPlugin.class).isEmpty() == false) {
++            controller.registerHandler(
++                guarded.apply(
++                    new WriterHandoffReceiptHandler(
++                        node::metadataPlane,
++                        node.threadPool(),
++                        () -> node.services().identityService().getCurrentSubject().getPrincipal(),
++                        handoffReader
++                    )
++                )
++            );
++        }
+         controller.registerHandler(guarded.apply(new org.opensearch.serverless.alias.AliasHandler(() -> node.metadataPlane(), () -> node)));
+         controller.registerHandler(
+             guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> node, () -> node.metadataPlane()))
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -11,11 +11,14 @@
+ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+ import org.opensearch.cluster.node.DiscoveryNodes;
+ import org.opensearch.common.blobstore.BlobPath;
++import org.opensearch.common.blobstore.ConditionalBlobContainer;
+ import org.opensearch.common.blobstore.fs.FsBlobStore;
+ import org.opensearch.common.settings.ClusterSettings;
+ import org.opensearch.common.settings.IndexScopedSettings;
+ import org.opensearch.common.settings.Settings;
+ import org.opensearch.common.settings.SettingsFilter;
++import org.opensearch.core.common.bytes.BytesArray;
++import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.core.rest.RestStatus;
+ import org.opensearch.identity.NamedPrincipal;
+ import org.opensearch.identity.tokens.BasicAuthToken;
+@@ -30,7 +33,10 @@
+ import org.opensearch.serverless.auth.ServerlessAuthPlugin;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.node.NodeSettings;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
++import org.opensearch.serverless.reconcile.WriterHandoffReport;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.test.OpenSearchTestCase;
+ 
+@@ -156,6 +162,71 @@
+ 
+     private ServerlessAuthPlugin authPlugin(Settings settings) {
+         return ServerlessAuthPlugin.withClock(settings, authClock::get);
++    }
++
++    public void testWriterHandoffReceiptRequiresTheConfiguredIdentity() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = plane(clock);
++        final Settings settings = Settings.builder()
++            .put(nodeSettings("auth-receipt"))
++            .put(NodeSettings.WRITER_HANDOFF_READER.getKey(), "receipt-reader")
++            .build();
++        final String path = "/_serverless/writer_handoffs/writer/old-process";
++        final String account = basic("receipt-reader", "reader-password");
++        try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
++            node.startup().start();
++            node.setMetadataPlane(plane);
++            ready(node, plane, clock);
++            final var result = new WriterHandoffReport.ShardResult(
++                new ShardId("alpha", "uuid-alpha", 0),
++                7L,
++                false,
++                WriterHandoffReport.Outcome.RELEASED_WITH_WAL,
++                true
++            );
++            new WriterHandoffReceiptStore(plane.blobStore(), BlobPath.cleanPath()).persist(
++                new WriterHandoffReport("writer", "old-process", List.of(result))
++            );
++
++            assertEquals(401, send(node, "GET", path, null, null).status());
++            assertEquals(403, send(node, "GET", path, basic(ADMIN, ADMIN_PASSWORD), null).status());
++            final Response created = send(
++                node,
++                "PUT",
++                "/_serverless/security/users/receipt-reader",
++                basic(ADMIN, ADMIN_PASSWORD),
++                "{\"password\":\"reader-password\"}"
++            );
++            assertEquals(created.body(), 200, created.status());
++            assertEquals(401, send(node, "GET", path, basic("receipt-reader", "wrong-password"), null).status());
++            final Response allowed = send(node, "GET", path, account, null);
++            assertEquals(allowed.body(), 200, allowed.status());
++            assertEquals("no-store", allowed.header("Cache-Control"));
++            assertTrue(allowed.body(), allowed.body().contains("\"ephemeral_id\":\"old-process\""));
++            assertTrue(allowed.body(), allowed.body().contains("\"term\":7"));
++            assertTrue(allowed.body(), allowed.body().contains("\"outcome\":\"RELEASED_WITH_WAL\""));
++            final Response missing = send(node, "GET", "/_serverless/writer_handoffs/writer/new-process", account, null);
++            assertEquals(404, missing.status());
++            assertTrue(missing.body(), missing.body().contains("writer_handoff_receipt_missing"));
++            final var receipts = ConditionalBlobContainer.of(plane.blobStore().blobContainer(BlobPath.cleanPath().add("writer-handoffs")));
++            assertTrue(receipts.createRegisterIfAbsent("writer.corrupt", new BytesArray(new byte[] { 99 })).applied());
++            final Response unreadable = send(node, "GET", "/_serverless/writer_handoffs/writer/corrupt", account, null);
++            assertEquals(503, unreadable.status());
++            assertTrue(unreadable.body(), unreadable.body().contains("writer_handoff_receipt_unavailable"));
++            assertEquals(400, send(node, "GET", "/_serverless/writer_handoffs/writer/bad.id", account, null).status());
++        }
++    }
++
++    public void testWriterHandoffReceiptRouteRequiresAnIdentityPlugin() throws Exception {
++        final Settings settings = Settings.builder()
++            .put(nodeSettings("receipt-no-identity"))
++            .put(NodeSettings.WRITER_HANDOFF_READER.getKey(), "receipt-reader")
++            .build();
++        try (ServerlessNode node = new ServerlessNode(settings)) {
++            node.startup().start();
++            final Response response = send(node, "GET", "/_serverless/writer_handoffs/writer/old-process", null, null);
++            assertTrue(response.body(), response.body().contains("no handler found for uri"));
++        }
+     }
+ 
+     /** A request with no credential is refused, and told how to offer one. */

@@ -1,0 +1,21 @@
+# Optional namespaced read access for --development-observe-endpoints.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensearch-serverless-endpoint-observer
+rules:
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opensearch-serverless-endpoint-observer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opensearch-serverless-endpoint-observer
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-serverless-operator

@@ -1,0 +1,193 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardEviction.java b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardEviction.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardEviction.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardEviction.java
+@@ -280,7 +280,7 @@
+             // record behind a seal. The fence makes the release wait for writes in flight and makes writes
+             // that arrive during it wait for the close -- after which they find no shard and are refused,
+             // which is the truthful answer.
+-            return reconciler.node.fences().underShardFence(shardId, () -> letGoFenced(shardId, reason, null));
++            return reconciler.node.fences().underShardFence(shardId, () -> letGoFenced(shardId, reason, false, null));
+         } catch (Exception e) {
+             // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
+             // logged and retried on the next pass rather than propagated into the tick.
+@@ -294,7 +294,7 @@
+     }
+ 
+     /** The body of {@link #letGo} for a writer, run while the shard's fence is held. */
+-    private boolean letGoFenced(ShardId shardId, String reason, Consumer<Outcome> onRelease) throws Exception {
++    private boolean letGoFenced(ShardId shardId, String reason, boolean deferClaimCleanup, Consumer<Outcome> onRelease) throws Exception {
+         final var shard = reconciler.node.reconciler().shard(shardId);
+         if (shard == null || reconciler.node.reconciler().isReader(shardId)) {
+             return false;
+@@ -395,8 +395,12 @@
+                 e.getClass().getSimpleName()
+             );
+         }
+-        // And forget the claim, so a node that churns through shards does not read a head per stale
+-        // claim on every heartbeat for the rest of its life.
++        // A claim is a hint checked against the head. Leave it to the live peer's
++        // janitor on prepared retirement so an advisory object delete cannot delay the receipt
++        // or lease release after the authoritative head has already been released.
++        if (deferClaimCleanup) {
++            return true;
++        }
+         reconciler.plane.forgetAssignment(reconciler.node.localNode().getId(), shardId.getIndexName(), shardId.id());
+         if (maxSeqNo < 0) {
+             // Opened and given back with nothing ever written: its entry would keep every wide search from ruling
+@@ -424,7 +428,7 @@
+      *
+      * @return the result for every local open writer observed after admission closed
+      */
+-    List<ShardResult> handOverOpenWriters() {
++    List<ShardResult> handOverOpenWriters(boolean deferClaimCleanup) {
+         final List<ShardResult> results = new ArrayList<>();
+         for (ShardId shardId : new ArrayList<>(reconciler.node.reconciler().openShards())) {
+             if (reconciler.node.reconciler().isReader(shardId)) {
+@@ -437,7 +441,7 @@
+                     final var outcome = new AtomicReference<>(Outcome.UNCONFIRMED);
+                     boolean cleanupComplete = false;
+                     try {
+-                        cleanupComplete = letGoFenced(shardId, "shutting down", outcome::set);
++                        cleanupComplete = letGoFenced(shardId, "shutting down", deferClaimCleanup, outcome::set);
+                     } catch (Exception e) {
+                         BackgroundReconciler.logger.warn(
+                             "Shutdown handoff or local cleanup failed (shard={}, error_type={})",
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
+@@ -220,10 +220,10 @@
+      * @return true if the head was given back here
+      */
+     boolean giveBack(WriterHibernation.Hibernated slept) {
+-        return giveBack(slept, null);
+-    }
+-
+-    private boolean giveBack(WriterHibernation.Hibernated slept, Consumer<Outcome> onRelease) {
++        return giveBack(slept, false, null);
++    }
++
++    private boolean giveBack(WriterHibernation.Hibernated slept, boolean deferClaimCleanup, Consumer<Outcome> onRelease) {
+         final ShardId shardId = slept.shardId();
+         if (reconciler.node.hibernation().released(slept) == false) {
+             // Woken meanwhile.
+@@ -243,7 +243,10 @@
+             if (onRelease != null) {
+                 onRelease.accept(WriterHandoffReport.outcomeOf(release));
+             }
+-            reconciler.plane.forgetAssignment(reconciler.node.localNode().getId(), shardId.getIndexName(), shardId.id());
++            // Prepared retirement leaves advisory assignment cleanup to the live peer.
++            if (deferClaimCleanup == false) {
++                reconciler.plane.forgetAssignment(reconciler.node.localNode().getId(), shardId.getIndexName(), shardId.id());
++            }
+             return release.accepted();
+         } catch (Exception e) {
+             // The head goes on naming this node with nothing open: the next request for it takes it the ordinary way, at
+@@ -262,11 +265,11 @@
+      *
+      * @return the outcome for each observed hibernated writer
+      */
+-    List<ShardResult> giveBackAll() {
++    List<ShardResult> giveBackAll(boolean deferClaimCleanup) {
+         final List<ShardResult> results = new ArrayList<>();
+         for (WriterHibernation.Hibernated slept : reconciler.node.hibernation().all()) {
+             final var outcome = new AtomicReference<>(Outcome.UNCONFIRMED);
+-            final boolean cleanupComplete = giveBack(slept, outcome::set);
++            final boolean cleanupComplete = giveBack(slept, deferClaimCleanup, outcome::set);
+             results.add(new ShardResult(slept.shardId(), slept.term(), true, outcome.get(), cleanupComplete));
+         }
+         return results;
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/BackgroundReconciler.java b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/BackgroundReconciler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/BackgroundReconciler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/BackgroundReconciler.java
+@@ -940,8 +940,14 @@
+     /** Hands off this process's observed writers after writer admission has closed. */
+     @InternalApi
+     public WriterHandoffReport handOverWriters() {
+-        final var results = eviction.handOverOpenWriters();
+-        results.addAll(hibernation.giveBackAll());
++        return handOverWriters(false);
++    }
++
++    /** A prepared retirement can leave advisory assignments for live peers to clean up. */
++    @InternalApi
++    public WriterHandoffReport handOverWriters(boolean deferClaimCleanup) {
++        final var results = eviction.handOverOpenWriters(deferClaimCleanup);
++        results.addAll(hibernation.giveBackAll(deferClaimCleanup));
+         final var local = node.localNode();
+         return new WriterHandoffReport(local.getId(), local.getEphemeralId(), results);
+     }
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java b/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
+@@ -420,6 +420,8 @@
+             return;
+         }
+         closed = true;
++        // Read the explicit retirement state before shutdown closes admission for ordinary restarts.
++        final boolean preparedRetirement = node.activation().isWriterTrafficWithdrawn() && node.activation().isWriterAdmissionClosed();
+         // First, while the node still runs: a search node that drains hands its warm shards to its peers before it goes.
+         if (SearchDrain.onShutdown(node)) {
+             SearchDrain.drain(node, plane);
+@@ -434,7 +436,7 @@
+         try {
+             // Publish and release what this node owns, so its shards are claimable at a fresh term the
+             // moment a peer or this node's own restart wants them.
+-            handoff = loop.handOverWriters();
++            handoff = loop.handOverWriters(preparedRetirement);
+             final long handed = handoff.releasedCount();
+             if (handoff.shards().isEmpty() == false) {
+                 final long withWal = handoff.shards().stream().filter(result -> result.outcome() == Outcome.RELEASED_WITH_WAL).count();
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
+@@ -305,6 +305,50 @@
+             final var report = loop.handOverWriters();
+             assertEquals(java.util.List.of(new ShardResult(open, term, false, Outcome.RELEASED, false)), report.shards());
+             assertNull(plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
++        }
++    }
++
++    public void testPreparedRetirementLeavesAdvisoryAssignmentsForOpenAndHibernatedWriters() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final BlobPath base = BlobPath.cleanPath();
++        try (
++            HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
++            ServerlessNode node = new ServerlessNode(nodeSettings("shutdown-cleanup"))
++        ) {
++            final MetadataPlane plane = new MetadataPlane(store, base, clock::get, TTL);
++            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 2, MAPPING, null));
++            node.startup().start();
++            node.setMetadataPlane(plane);
++            final BackgroundReconciler loop = loop(node, plane);
++            final ShardId sleeping = writeSome(node, plane, 0, 0, 2);
++            final long sleepingTerm = node.reconciler().shard(sleeping).getOperationPrimaryTerm();
++            clock.addAndGet(HIBERNATE_AFTER + 1);
++            loop.tick(clock.get());
++            assertTrue(node.hibernation().isHibernated("alpha", 0));
++            final ShardId open = writeSome(node, plane, 1, 2, 2);
++            final long openTerm = node.reconciler().shard(open).getOperationPrimaryTerm();
++            loop.close();
++            node.activation().closeWriterAdmission();
++            final String local = node.localNode().getId();
++            final String claims = RegisterMap.assignments(base, local).buildAsString();
++            store.onNextBlobDelete(claims, RegisterMap.assignmentBlob("alpha", 1), () -> {
++                fail("shutdown must not wait for an advisory assignment delete");
++            });
++            final var report = loop.handOverWriters(true);
++            assertEquals(
++                java.util.Set.of(
++                    new ShardResult(open, openTerm, false, Outcome.RELEASED, true),
++                    new ShardResult(sleeping, sleepingTerm, true, Outcome.RELEASED_WITH_WAL, true)
++                ),
++                java.util.Set.copyOf(report.shards())
++            );
++            assertNull(plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
++            assertNull(plane.heads().read("alpha", 1).orElseThrow().ownerNodeId());
++            assertEquals(
++                java.util.Set.of(java.util.Map.entry("alpha", 0), java.util.Map.entry("alpha", 1)),
++                java.util.Set.copyOf(plane.claimsOf(local))
++            );
++            assertTrue(plane.truthFor(local).assignments().isEmpty());
+         }
+     }
+ 

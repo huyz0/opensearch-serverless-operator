@@ -1,0 +1,155 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+@@ -84,9 +84,15 @@
+ 
+     /** Reserves the JVM for one retirement and withdraws client readiness without closing writer admission. */
+     @InternalApi
+-    public synchronized RetirementState withdrawForRetirement(String operation) {
++    public RetirementState withdrawForRetirement(String operation) {
++        return withdrawForRetirement(operation, Long.MAX_VALUE);
++    }
++
++    /** Rejects a queued withdrawal whose authorization expired before reaching the reservation lock. */
++    @InternalApi
++    public synchronized RetirementState withdrawForRetirement(String operation, long withdrawBeforeMillis) {
+         final RetirementState state = retirementState(operation);
+-        if (state != RetirementState.OPEN) {
++        if (state != RetirementState.OPEN || System.currentTimeMillis() >= withdrawBeforeMillis) {
+             return state;
+         }
+         retirementOperation = java.util.Objects.requireNonNull(operation);
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
+@@ -31,6 +31,7 @@
+ public final class WriterRetirementHandler extends BaseRestHandler {
+     private static final String PATH = "/_serverless/writer_retirement/{node_id}/{ephemeral_id}/{operation_id}";
+     private static final String WITHDRAWAL = "/_serverless/writer_withdrawal/";
++    private static final String WITHDRAWAL_PATH = WITHDRAWAL + "{node_id}/{ephemeral_id}/{operation_id}";
+     private final NodeContext node;
+     private final Supplier<Principal> principal;
+     private final String preparer;
+@@ -52,7 +53,8 @@
+             new Route(RestRequest.Method.GET, PATH),
+             new Route(RestRequest.Method.POST, PATH),
+             new Route(RestRequest.Method.POST, PATH + "/prepare_before/{deadline_millis}"),
+-            new Route(RestRequest.Method.POST, WITHDRAWAL + "{node_id}/{ephemeral_id}/{operation_id}")
++            new Route(RestRequest.Method.POST, WITHDRAWAL_PATH),
++            new Route(RestRequest.Method.POST, WITHDRAWAL_PATH + "/withdraw_before/{deadline_millis}")
+         );
+     }
+ 
+@@ -89,14 +91,21 @@
+         }
+         final boolean observing = request.method() == RestRequest.Method.GET;
+         final boolean withdrawing = request.path().startsWith(WITHDRAWAL);
+-        final long prepareBeforeMillis = request.paramAsLong("deadline_millis", Long.MAX_VALUE);
++        final long deadlineMillis = request.paramAsLong("deadline_millis", Long.MAX_VALUE);
+         return channel -> node.threadPool().generic().execute(new AbstractRunnable() {
+             @Override
+             protected void doRun() throws IOException {
+                 final RetirementState state = withdrawing
+-                    ? node.activation().withdrawForRetirement(operation)
++                    ? node.activation().withdrawForRetirement(operation, deadlineMillis)
+                     : node.activation().retirementState(operation);
+-                if (state == RetirementState.OPEN && observing == false) {
++                if (withdrawing && state == RetirementState.OPEN) {
++                    error(
++                        channel,
++                        RestStatus.SERVICE_UNAVAILABLE,
++                        "writer_withdrawal_deadline_expired",
++                        "writer withdrawal deadline expired"
++                    );
++                } else if (state == RetirementState.OPEN && observing == false) {
+                     error(
+                         channel,
+                         RestStatus.CONFLICT,
+@@ -111,7 +120,7 @@
+                     }
+                     final RetirementState result = observing || withdrawing
+                         ? node.activation().retirementState(operation)
+-                        : node.activation().prepareRetirement(operation, prepareBeforeMillis);
++                        : node.activation().prepareRetirement(operation, deadlineMillis);
+                     if (observing == false && withdrawing == false && result == RetirementState.WITHDRAWN) {
+                         error(
+                             channel,
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -354,12 +354,24 @@
+ 
+             assertEquals(409, sendAt(client, "POST", path, preparer, null).status());
+             assertEquals(403, sendAt(client, "POST", withdrawal + "/operation-a", admin, null).status());
+-            assertEquals(503, sendAt(client, "POST", withdrawal + "/operation-a", preparer, null).status());
++            final String timedWithdrawal = withdrawal + "/operation-a/withdraw_before/";
++            final Response expiredWithdrawal = sendAt(client, "POST", timedWithdrawal + "1", preparer, null);
++            assertEquals(expiredWithdrawal.body(), 503, expiredWithdrawal.status());
++            assertTrue(expiredWithdrawal.body(), expiredWithdrawal.body().contains("writer_withdrawal_deadline_expired"));
++            assertEquals(unprepared.body(), sendAt(client, "GET", path, preparer, null).body());
++            assertEquals(200, sendAt(client, "GET", base + "/_serverless/ready", admin, null).status());
++            node.leases().renewLease(plane);
++            assertTrue(plane.membership().read(process.getId()).orElseThrow().acceptsNewWriters());
++
++            assertEquals(
++                503,
++                sendAt(client, "POST", timedWithdrawal + (System.currentTimeMillis() + 10_000), preparer, null).status()
++            );
+             assertEquals(503, sendAt(client, "GET", path, preparer, null).status());
+             assertEquals(503, sendAt(client, "POST", path, preparer, null).status());
+             assertFalse(node.activation().isWriterAdmissionClosed());
+             node.leases().renewLease(plane);
+-            final Response withdrawn = sendAt(client, "POST", withdrawal + "/operation-a", preparer, null);
++            final Response withdrawn = sendAt(client, "POST", timedWithdrawal + "1", preparer, null);
+             assertEquals(withdrawn.body(), 200, withdrawn.status());
+             assertTrue(withdrawn.body(), withdrawn.body().contains("\"state\":\"withdrawn\""));
+             final var lease = plane.membership().read(process.getId()).orElseThrow();
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java
+@@ -14,6 +14,7 @@
+ import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.cluster.ShardAssignment;
+ import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.node.WriterActivation.RetirementState;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.serverless.store.SegmentPublisher;
+ import org.opensearch.test.OpenSearchTestCase;
+@@ -21,6 +22,7 @@
+ import java.util.List;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.Executors;
++import java.util.concurrent.FutureTask;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+@@ -104,6 +106,29 @@
+         }
+     }
+ 
++    public void testWriterWithdrawalExpiresWhileWaitingForTheReservationLock() throws Exception {
++        try (var node = new ServerlessNode(settings("withdrawal-expiry"))) {
++            final var activation = node.activation();
++            final long deadline = System.currentTimeMillis() + 5_000;
++            final var withdrawal = new FutureTask<>(() -> activation.withdrawForRetirement("operation", deadline));
++            final var worker = new Thread(withdrawal, "queued-withdrawal");
++            try {
++                synchronized (activation) {
++                    worker.start();
++                    assertBusy(() -> assertEquals(Thread.State.BLOCKED, worker.getState()));
++                    assertTrue("withdrawal must reach the lock before expiry", System.currentTimeMillis() < deadline);
++                    assertBusy(() -> assertTrue(System.currentTimeMillis() >= deadline));
++                }
++                assertEquals(RetirementState.OPEN, withdrawal.get(30, TimeUnit.SECONDS));
++                assertFalse(activation.isWriterTrafficWithdrawn());
++                assertEquals(RetirementState.WITHDRAWN, activation.withdrawForRetirement("operation", Long.MAX_VALUE));
++            } finally {
++                worker.join(TimeUnit.SECONDS.toMillis(30));
++                assertFalse("withdrawal worker did not exit", worker.isAlive());
++            }
++        }
++    }
++
+     public void testWriterAdmissionClosesBeforeWaitingForAnAdmittedOpen() throws Exception {
+         try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+             final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);

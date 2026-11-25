@@ -1,0 +1,22 @@
+apiVersion: serverless.opensearch.org/v1alpha1
+kind: OpenSearchServerless
+metadata:
+  name: catalog
+  namespace: search-system
+spec:
+  image: registry.example.com/serverless@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  serviceAccountName: catalog-runtime
+  storage:
+    type: s3
+    repositoryRef: {name: catalog-remote-store}
+    credentials: {type: WorkloadIdentity, awsRoleArn: 'arn:aws:iam::123456789012:role/serverless-store'}
+  pools:
+    search:
+      zones:
+        zone-a: {replicas: 3, minServing: 2}
+    ingest:
+      zones:
+        zone-a: {replicas: 2, minServing: 1}
+  plugins:
+    - name: catalog-analysis
+      artifact: registry.example.com/plugins/catalog-analysis@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

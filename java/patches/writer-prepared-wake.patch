@@ -1,0 +1,543 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+@@ -14,6 +14,7 @@
+ import org.opensearch.common.lease.Releasable;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.cluster.ShardAssignment;
++import org.opensearch.serverless.metadata.ShardHead;
+ 
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+@@ -26,6 +27,7 @@
+     private final NodeContext node;
+     private final ReentrantReadWriteLock writerAdmission = new ReentrantReadWriteLock();
+     private volatile boolean writerAdmissionClosed;
++    private volatile boolean writerShutdown;
+     private volatile String retirementOperation;
+     private boolean admittedWritersDrained;
+ 
+@@ -37,8 +39,13 @@
+     @InternalApi
+     public void closeWriterAdmission() {
+         synchronized (this) {
++            writerShutdown = true;
+             writerAdmissionClosed = true;
+         }
++        waitForAdmittedWriters();
++    }
++
++    private void waitForAdmittedWriters() {
+         final var barrier = writerAdmission.writeLock();
+         barrier.lock();
+         try {
+@@ -108,23 +115,41 @@
+             }
+             writerAdmissionClosed = true;
+         }
+-        closeWriterAdmission();
++        waitForAdmittedWriters();
+         return RetirementState.CLOSED;
+     }
+ 
+-    /** Whether the process has stopped accepting writer acquisitions and reopens. */
++    /** Whether the process has stopped admitting new writer acquisitions. */
+     @InternalApi
+     public boolean isWriterAdmissionClosed() {
+         return writerAdmissionClosed;
+     }
+ 
+     private Releasable enterWriterAdmission() {
+-        if (isWriterAdmissionClosed()) {
++        return enterWriterAdmission(false);
++    }
++
++    /** A writer eviction already in flight may finish before retirement reaches its admission barrier. */
++    @InternalApi
++    public Releasable enterWriterEviction() {
++        if (isWriterTrafficWithdrawn()) {
++            return null;
++        }
++        final Releasable admitted = enterWriterAdmission();
++        if (admitted != null && isWriterTrafficWithdrawn()) {
++            admitted.close();
++            return null;
++        }
++        return admitted;
++    }
++
++    private Releasable enterWriterAdmission(boolean existingOwnerOnly) {
++        if (writerShutdown || (writerAdmissionClosed && existingOwnerOnly == false)) {
+             return null;
+         }
+         final var admission = writerAdmission.readLock();
+         admission.lock();
+-        if (isWriterAdmissionClosed()) {
++        if (writerShutdown || (writerAdmissionClosed && existingOwnerOnly == false)) {
+             admission.unlock();
+             return null;
+         }
+@@ -346,14 +371,23 @@
+         int shardNumber
+     ) throws Exception {
+         try (Releasable admission = enterWriterAdmission()) {
+-            return admission != null ? activateAdmittedWriter(plane, indexName, shardNumber) : java.util.Optional.empty();
++            if (admission != null) {
++                return activateAdmittedWriter(plane, indexName, shardNumber, false);
++            }
++        }
++        if (node.hibernation.isHibernated(indexName, shardNumber) == false) {
++            return java.util.Optional.empty();
++        }
++        try (Releasable admission = enterWriterAdmission(true)) {
++            return admission != null ? activateAdmittedWriter(plane, indexName, shardNumber, true) : java.util.Optional.empty();
+         }
+     }
+ 
+     private java.util.Optional<org.opensearch.core.index.shard.ShardId> activateAdmittedWriter(
+         org.opensearch.serverless.metadata.MetadataPlane plane,
+         String indexName,
+-        int shardNumber
++        int shardNumber,
++        boolean existingOwnerOnly
+     ) throws Exception {
+         node.ensureStarted();
+         if (node.roles.contains(NodeContext.ROLE_INGEST) == false) {
+@@ -415,9 +449,12 @@
+         final long acquiringAt = System.nanoTime();
+         node.nodeCapacity().activationPhases[0].addAndGet(acquiringAt - describedAt);
+         // A writer this node hibernated wakes at the term it was open at, with one head read instead of a takeover.
+-        final org.opensearch.serverless.metadata.Acquisition woken = wake(plane, indexName, shardNumber, described.get());
++        final Wake woken = wake(plane, indexName, shardNumber, described.get(), existingOwnerOnly);
++        if (woken == null && existingOwnerOnly) {
++            return java.util.Optional.empty();
++        }
+         final org.opensearch.serverless.metadata.Acquisition acquisition = woken != null
+-            ? woken
++            ? org.opensearch.serverless.metadata.Acquisition.won(woken.head())
+             : plane.activate(indexName, shardNumber, node.localNode.getId(), node.localNode.getEphemeralId(), described.get().uuid());
+         node.nodeCapacity().activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
+         if (acquisition.acquired() == false) {
+@@ -438,13 +475,13 @@
+         final String openingKey = NodeContext.shardKey(indexName, shardNumber);
+         node.fences.writerAssignments.put(openingKey, assignment);
+         node.readerServing.openingShards.add(openingKey);
+-        // Whose node logs the open replays: every node the head names as holding what was not published.
+-        final NodeLogWriter nodeLog = node.nodeLogs.nodeLog(plane);
+-        if (nodeLog != null) {
+-            nodeLog.noteHeadMoved(indexName, shardNumber);
+-        }
+-        node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
+         try {
++            // Whose node logs the open replays: every node the head names as holding what was not published.
++            final NodeLogWriter nodeLog = node.nodeLogs.nodeLog(plane);
++            if (nodeLog != null) {
++                nodeLog.noteHeadMoved(indexName, shardNumber);
++            }
++            node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
+             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
+             // documents its published digest does not describe.
+             //
+@@ -461,27 +498,31 @@
+             node.nodeCapacity().activationPhases[3].addAndGet(System.nanoTime() - openingAt);
+             node.nodeCapacity().activationsOpened.incrementAndGet();
+             node.fences().confirmIncarnation(described.get().uuid(), describedAt);
++            if (existingOwnerOnly) {
++                node.hibernation.noteWoken();
++            }
+         } catch (Exception e) {
+-            // The head was won and the shard could not be opened. Held and unserved, that head would
+-            // refuse every other node's acquisition for as long as this node's lease lives, and nothing
+-            // on this node would try again: a shard nobody serves and nobody is looking for. Give the
+-            // head back, so the next node to ask -- possibly this one -- acquires cleanly.
+             node.fences.writerAssignments.remove(NodeContext.shardKey(indexName, shardNumber));
+             node.sightings().noteHead(indexName, shardNumber, null);
+-            try {
+-                // The head goes on naming every log it named, and this node's own: an open that failed published nothing.
+-                plane.heads()
+-                    .release(
+-                        indexName,
+-                        shardNumber,
+-                        node.localNode.getId(),
+-                        assignment.term(),
+-                        described.get().uuid(),
+-                        node.localNode.getEphemeralId()
+-                    );
+-                plane.forgetAssignment(node.localNode.getId(), indexName, shardNumber);
+-            } catch (Exception giveBack) {
+-                e.addSuppressed(giveBack);
++            if (existingOwnerOnly) {
++                // Retry the owned reopen or account for it during shutdown. The retirement inventory keeps the same head.
++                node.hibernation.restore(woken.sleeper());
++            } else {
++                try {
++                    // A failed acquisition's head goes back with every log it named, so another node can take it.
++                    plane.heads()
++                        .release(
++                            indexName,
++                            shardNumber,
++                            node.localNode.getId(),
++                            assignment.term(),
++                            described.get().uuid(),
++                            node.localNode.getEphemeralId()
++                        );
++                    plane.forgetAssignment(node.localNode.getId(), indexName, shardNumber);
++                } catch (Exception giveBack) {
++                    e.addSuppressed(giveBack);
++                }
+             }
+             throw e;
+         } finally {
+@@ -497,33 +538,52 @@
+      * Wakes a writer this node hibernated, if its head still names this process at the term it hibernated at.
+      *
+      * <p>The head is read, not assumed: a lease that lapsed while the writer slept may have let another node take
+-     * it, and the index may have been recreated under the same name. Either way the record is dropped and the
+-     * shard is taken the ordinary way, which finds out who holds it.
+-     *
+-     * @return the head, as if it had just been won; or null to take the shard the ordinary way
++     * it, and the index may have been recreated under the same name. Only ordinary admission can fall back to acquisition.
++     *
++     * @return the hibernation record and still-owned head, or null if neither can be used
+      */
+-    private org.opensearch.serverless.metadata.Acquisition wake(
++    private Wake wake(
+         org.opensearch.serverless.metadata.MetadataPlane plane,
+         String indexName,
+         int shardNumber,
+-        IndexDescriptor described
++        IndexDescriptor described,
++        boolean existingOwnerOnly
+     ) throws java.io.IOException {
+         final WriterHibernation.Hibernated slept = node.hibernation.take(indexName, shardNumber);
+         if (slept == null) {
+             return null;
+         }
+-        if (slept.shardId().getIndex().getUUID().equals(described.uuid())) {
+-            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads().read(indexName, shardNumber);
+-            if (head.isPresent() && head.get().term() == slept.term() && node.leases.namesThisNode(head, slept.shardId())
+-            // Live by this node's own lease, which the activation renewed if it was near its end: reading it back would
+-            // cost a request to learn what this node already knows.
+-                && plane.membership().selfLeaseValidAt(plane.clock().getAsLong())
+-                && node.leases().ownershipUnverified == false) {
+-                node.hibernation.noteWoken();
+-                return org.opensearch.serverless.metadata.Acquisition.won(head.get());
+-            }
++        try {
++            if (slept.shardId().getIndex().getUUID().equals(described.uuid())) {
++                final java.util.Optional<ShardHead> head = plane.heads().read(indexName, shardNumber);
++                if (head.isPresent() && head.get().term() == slept.term() && node.leases.namesThisNode(head, slept.shardId())) {
++                    final boolean exact = described.uuid().equals(head.get().indexUuid())
++                        && node.localNode.getEphemeralId().equals(head.get().ownerEphemeralId());
++                    if ((existingOwnerOnly == false || exact)
++                        && plane.membership().selfLeaseValidAt(plane.clock().getAsLong())
++                        && node.leases().ownershipUnverified == false) {
++                        if (existingOwnerOnly == false) {
++                            node.hibernation.noteWoken();
++                        }
++                        return new Wake(slept, head.get());
++                    }
++                    if (existingOwnerOnly) {
++                        // Keep the record for a lease-renewal retry or shutdown accounting for a legacy head.
++                        node.hibernation.restore(slept);
++                        return null;
++                    }
++                }
++            }
++        } catch (java.io.IOException | RuntimeException e) {
++            if (existingOwnerOnly) {
++                node.hibernation.restore(slept);
++            }
++            throw e;
+         }
+         node.hibernation.noteMissedWake();
+         return null;
+     }
++
++    private record Wake(WriterHibernation.Hibernated sleeper, ShardHead head) {
++    }
+ }
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterHibernation.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterHibernation.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterHibernation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterHibernation.java
+@@ -87,6 +87,10 @@
+         return byShard.remove(NodeContext.shardKey(indexName, shard));
+     }
+ 
++    void restore(Hibernated hibernated) {
++        byShard.putIfAbsent(NodeContext.shardKey(hibernated.shardId().getIndexName(), hibernated.shardId().id()), hibernated);
++    }
++
+     /**
+      * Forgets a hibernated writer whose head was given back, or was found to be somebody else's.
+      *
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardActivations.java b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardActivations.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardActivations.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardActivations.java
+@@ -477,6 +477,10 @@
+             if (open != null && reconciler.node.reconciler().isReader(open) == false) {
+                 return Optional.of(open);
+             }
++            if (reconciler.node.activation().isWriterAdmissionClosed()
++                && reconciler.node.hibernation().isHibernated(indexName, shard) == false) {
++                return Optional.empty();
++            }
+             boolean reserved = false;
+             if (onDemand) {
+                 // heldShards, not openShards: a frozen view occupies the node as much as any other shard, so
+@@ -493,6 +497,10 @@
+                         reserved = true;
+                     }
+                 }
++                if (full && reconciler.node.activation().isWriterAdmissionClosed()) {
++                    // An owned wake may use available capacity during retirement. It cannot evict another writer.
++                    return Optional.empty();
++                }
+                 if (full && takeoverMayOvercommit(indexName, shard)) {
+                     // A dead member's shard, and room under the takeover ceiling: taken without evicting. Evicting here put
+                     // a publish and a head release in front of every shard a survivor near its cap took from a dead node,
+@@ -520,7 +528,12 @@
+                     // Room is made outside the lock. An eviction is a publish and a head release, and every activation
+                     // reserves its slot under this lock: evicting inside it made the survivors of a node that died with
+                     // them at the cap take its shards one eviction at a time, p99 two minutes.
+-                    reconciler.makeRoom();
++                    try (var admission = reconciler.node.activation().enterWriterEviction()) {
++                        if (admission == null) {
++                            return Optional.empty();
++                        }
++                        reconciler.makeRoom();
++                    }
+                 }
+                 synchronized (reconciler.capLock) {
+                     if (reserved) {
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
+@@ -69,10 +69,14 @@
+                     hibernate(shardId, lastUsed, nowMillis);
+                 }
+             }
+-            if (reconciler.idleAfterMillis > 0) {
++            if (reconciler.idleAfterMillis > 0 && reconciler.node.activation().isWriterTrafficWithdrawn() == false) {
+                 for (WriterHibernation.Hibernated slept : reconciler.node.hibernation().all()) {
+-                    if (nowMillis - slept.lastUsedMillis() >= reconciler.idleAfterMillis && giveBack(slept)) {
+-                        released.add(slept.shardId());
++                    if (nowMillis - slept.lastUsedMillis() >= reconciler.idleAfterMillis) {
++                        try (var admission = reconciler.node.activation().enterWriterEviction()) {
++                            if (admission != null && giveBack(slept)) {
++                                released.add(slept.shardId());
++                            }
++                        }
+                     }
+                 }
+             }
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
+@@ -17,6 +17,7 @@
+ import org.opensearch.serverless.metadata.MetadataPlane;
+ import org.opensearch.serverless.metadata.RegisterMap;
+ import org.opensearch.serverless.metadata.ShardHead;
++import org.opensearch.serverless.node.WriterActivation.RetirementState;
+ import org.opensearch.serverless.ops.DocumentRouting;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
+ import org.opensearch.serverless.reconcile.ReconcileScheduler;
+@@ -47,7 +48,7 @@
+     private static final long IDLE_AFTER = 600_000L;
+     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
+ 
+-    private Settings nodeSettings(String name) {
++    private static Settings nodeSettings(String name) {
+         return Settings.builder()
+             .put("node.name", name)
+             .put("cluster.name", "serverless-hibernation")
+@@ -396,6 +397,153 @@
+         }
+     }
+ 
++    public void testPreparedWriterWakesAtItsOwnTermAndHandsOffAcknowledgedWrites() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = plane(clock, 1);
++        assertPreparedWriterHandoff(plane, clock);
++    }
++
++    static void assertPreparedWriterHandoff(MetadataPlane plane, AtomicLong clock) throws Exception {
++        plane.createIndex(new IndexDescriptor("cold", "uuid-cold", 1, MAPPING, null));
++        try (
++            ServerlessNode retiring = new ServerlessNode(nodeSettings("retiring"));
++            ServerlessNode survivor = new ServerlessNode(nodeSettings("survivor"))
++        ) {
++            retiring.startup().start();
++            retiring.setMetadataPlane(plane);
++            survivor.startup().start();
++            survivor.setMetadataPlane(plane);
++            final BackgroundReconciler loop = loop(retiring, plane);
++            final ShardId shard;
++            final long term;
++            try (
++                ReconcileScheduler scheduler = new ReconcileScheduler(
++                    loop,
++                    retiring.threadPool(),
++                    plane.clock(),
++                    TimeValue.timeValueHours(1),
++                    TimeValue.timeValueMillis(20),
++                    null
++                )
++            ) {
++                retiring.setSignals(scheduler);
++                scheduler.start();
++                shard = writeSome(retiring, plane, 0, 0, 2);
++                term = plane.heads().read("alpha", 0).orElseThrow().term();
++                clock.addAndGet(HIBERNATE_AFTER + 1);
++                retiring.leases().renewLease(plane);
++                survivor.leases().renewLease(plane);
++                plane.membership().refresh();
++                loop.tick(clock.get());
++                assertTrue(retiring.hibernation().isHibernated("alpha", 0));
++
++                assertEquals(RetirementState.WITHDRAWN, retiring.activation().withdrawForRetirement("retire"));
++                assertEquals(RetirementState.CLOSED, retiring.activation().prepareRetirement("retire"));
++                assertTrue(retiring.activation().activateWriter(plane, "cold", 0).isEmpty());
++                assertTrue(plane.heads().read("cold", 0).isEmpty());
++
++                assertEquals(201, put(survivor, "/alpha/_doc/forwarded?refresh=true", "{\"msg\":\"forwarded\"}"));
++                final ShardHead before = plane.heads().read("alpha", 0).orElseThrow();
++                assertEquals(term, before.term());
++                assertEquals(retiring.localNode().getEphemeralId(), before.ownerEphemeralId());
++                assertEquals(3, count(retiring, shard));
++
++                clock.addAndGet(HIBERNATE_AFTER + 1);
++                retiring.leases().renewLease(plane);
++                loop.tick(clock.get());
++                assertTrue(retiring.hibernation().isHibernated("alpha", 0));
++                // Retirement reserves this sleeper for shutdown handoff even if its normal idle timeout passes.
++                clock.addAndGet(IDLE_AFTER);
++                retiring.leases().renewLease(plane);
++                loop.tick(clock.get());
++                assertEquals(term, plane.heads().read("alpha", 0).orElseThrow().term());
++                assertTrue(retiring.hibernation().isHibernated("alpha", 0));
++            }
++            loop.close();
++            retiring.activation().closeWriterAdmission();
++            assertTrue(retiring.activation().activateWriter(plane, "alpha", 0).isEmpty());
++            assertEquals(
++                java.util.List.of(new ShardResult(shard, term, true, Outcome.RELEASED_WITH_WAL, true)),
++                loop.handOverWriters().shards()
++            );
++
++            final ShardId reopened = survivor.activation().activateWriter(plane, "alpha", 0).orElseThrow();
++            final ShardHead after = plane.heads().read("alpha", 0).orElseThrow();
++            assertEquals(survivor.localNode().getEphemeralId(), after.ownerEphemeralId());
++            assertTrue(after.term() > term);
++            assertEquals(201, put(survivor, "/alpha/_doc/successor?refresh=true", "{\"msg\":\"successor\"}"));
++            assertEquals(4, count(survivor, reopened));
++            for (String id : java.util.List.of("d0", "d1", "forwarded", "successor")) {
++                assertTrue("survivor can read " + id, survivor.reads().get(reopened, id).found());
++            }
++        }
++    }
++
++    public void testPreparedWakeRetriesFailedReadsAndCannotAcquireAReleasedHead() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        try (
++            HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
++            ServerlessNode node = new ServerlessNode(nodeSettings("retirement-retry"))
++        ) {
++            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
++            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha", 1, MAPPING, null));
++            node.startup().start();
++            node.setMetadataPlane(plane);
++            final BackgroundReconciler loop = loop(node, plane);
++            writeSome(node, plane, 0, 0, 2);
++            clock.addAndGet(HIBERNATE_AFTER + 1);
++            loop.tick(clock.get());
++            assertTrue(node.hibernation().isHibernated("alpha", 0));
++            final ShardHead held = plane.heads().read("alpha", 0).orElseThrow();
++            assertEquals(RetirementState.WITHDRAWN, node.activation().withdrawForRetirement("retire"));
++            assertEquals(RetirementState.CLOSED, node.activation().prepareRetirement("retire"));
++            store.failRegisterReadsUnder(RegisterMap.shards(BlobPath.cleanPath()).buildAsString());
++            expectThrows(java.io.IOException.class, () -> node.activation().activateWriter(plane, "alpha", 0));
++            store.failRegisterReadsUnder(null);
++            assertTrue(node.hibernation().isHibernated("alpha", 0));
++            store.onNextRegisterRead(
++                RegisterMap.shards(BlobPath.cleanPath()).buildAsString(),
++                RegisterMap.shardHeadBlob("alpha", 0),
++                () -> {
++                    throw new IllegalStateException("could not parse the stored head");
++                }
++            );
++            expectThrows(IllegalStateException.class, () -> node.activation().activateWriter(plane, "alpha", 0));
++            assertTrue(node.hibernation().isHibernated("alpha", 0));
++            final ShardId retried = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
++            node.writes().index(retried, "retry", "{\"msg\":\"retry\"}");
++            assertEquals(held.ownerEphemeralId(), plane.heads().read("alpha", 0).orElseThrow().ownerEphemeralId());
++            clock.addAndGet(HIBERNATE_AFTER + 1);
++            loop.tick(clock.get());
++            assertTrue(node.hibernation().isHibernated("alpha", 0));
++            assertTrue(plane.heads().release("alpha", 0, held.ownerNodeId(), held.term(), held.indexUuid(), held.ownerEphemeralId()));
++            assertTrue(node.activation().activateWriter(plane, "alpha", 0).isEmpty());
++            assertTrue(plane.heads().read("alpha", 0).map(ShardHead::ownerNodeId).isEmpty());
++        }
++    }
++
++    public void testPreparedWakeCannotEvictAnotherWriterAtCapacity() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = plane(clock, 2);
++        try (ServerlessNode node = new ServerlessNode(nodeSettings("retirement-capacity"))) {
++            node.startup().start();
++            node.setMetadataPlane(plane);
++            final BackgroundReconciler loop = loop(node, plane).setMaxShardsHeld(1);
++            writeSome(node, plane, 0, 0, 2);
++            clock.addAndGet(HIBERNATE_AFTER + 1);
++            loop.tick(clock.get());
++            assertTrue(node.hibernation().isHibernated("alpha", 0));
++            final ShardId other = writeSome(node, plane, 1, 2, 1);
++            assertEquals(RetirementState.WITHDRAWN, node.activation().withdrawForRetirement("retire"));
++            assertEquals(RetirementState.CLOSED, node.activation().prepareRetirement("retire"));
++
++            assertTrue(loop.activateForRequest("alpha", 0).get(10, java.util.concurrent.TimeUnit.SECONDS).isEmpty());
++            assertTrue(node.hibernation().isHibernated("alpha", 0));
++            assertNotNull(node.reconciler().writerShard(other));
++            assertEquals(node.localNode().getEphemeralId(), plane.heads().read("alpha", 1).orElseThrow().ownerEphemeralId());
++        }
++    }
++
+     private static int put(ServerlessNode node, String path, String body) throws Exception {
+         return send(node, "PUT", path, body);
+     }
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java
+@@ -18,6 +18,7 @@
+ import org.opensearch.core.common.bytes.BytesReference;
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.repositories.s3.MinioBlobStores;
++import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.metadata.MetadataPlane;
+ import org.opensearch.serverless.metadata.ShardHeadStore;
+ import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
+@@ -35,6 +36,7 @@
+ import java.util.List;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
+ 
+ /**
+  * The blob-store conformance suite against a real S3 API.
+@@ -156,6 +158,16 @@
+         }
+     }
+ 
++    public void testPreparedHibernationHandoffContinuesWritesAtTheSuccessor() throws Exception {
++        final BlobContainer fixture = newContainer();
++        try (var backing = store()) {
++            final AtomicLong clock = new AtomicLong(1_000L);
++            final var plane = new MetadataPlane(backing, fixture.path(), clock::get, 30_000L);
++            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, "{}", null));
++            WriterHibernationTests.assertPreparedWriterHandoff(plane, clock);
++        }
++    }
++
+     private org.opensearch.common.blobstore.BlobStore lastStore;
+ 
+     @Override

@@ -1,0 +1,14 @@
+apiVersion: serverless.opensearch.org/v1alpha1
+kind: OpenSearchServerlessOperation
+metadata:
+  name: catalog-promote
+  namespace: search-system
+spec:
+  instanceRef:
+    name: catalog
+    uid: 258b3be2-0f79-4e96-aeb8-637de33ad6d3
+  action: Promote
+  targetFleet: fleet-b28
+  expectedServingFleetByRole:
+    search: fleet-a17
+    ingest: fleet-a17

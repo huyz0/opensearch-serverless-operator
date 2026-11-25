@@ -1,0 +1,83 @@
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
+@@ -23,6 +23,7 @@
+ import org.opensearch.serverless.reconcile.ReconcileScheduler;
+ import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
+ import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.test.OpenSearchTestCase;
+ 
+@@ -281,6 +282,71 @@
+             assertTrue(plane.heads().read("alpha", 1).map(ShardHead::ownerNodeId).isEmpty());
+         }
+     }
++
++    public void testPartialShutdownReceiptAllowsTakeoverOfTheUnconfirmedShard() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final BlobPath base = BlobPath.cleanPath();
++        final String uuid = "uuid-alpha-00000000";
++        try (HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
++            final MetadataPlane plane = new MetadataPlane(store, base, clock::get, TTL);
++            plane.createIndex(new IndexDescriptor("alpha", uuid, 2, MAPPING, null));
++            final String writerId;
++            final String writerEpoch;
++            final long firstTerm;
++            final long secondTerm;
++            try (ServerlessNode writer = new ServerlessNode(nodeSettings("partial-receipt-writer"))) {
++                writer.startup().start();
++                writer.setMetadataPlane(plane);
++                final BackgroundReconciler loop = loop(writer, plane);
++                final ShardId first = writeSome(writer, plane, 0, 0, 2);
++                final ShardId second = writeSome(writer, plane, 1, 2, 2);
++                firstTerm = writer.reconciler().shard(first).getOperationPrimaryTerm();
++                secondTerm = writer.reconciler().shard(second).getOperationPrimaryTerm();
++                writerId = writer.localNode().getId();
++                writerEpoch = writer.localNode().getEphemeralId();
++                loop.close();
++                writer.activation().closeWriterAdmission();
++                store.failRegisterWritesUnder(RegisterMap.shardData(base, "alpha", uuid, 1).buildAsString());
++                final var report = loop.handOverWriters();
++                assertEquals(1L, report.releasedCount());
++                assertEquals(
++                    java.util.Set.of(
++                        new ShardResult(first, firstTerm, false, Outcome.RELEASED, true),
++                        new ShardResult(second, secondTerm, false, Outcome.UNCONFIRMED, false)
++                    ),
++                    java.util.Set.copyOf(report.shards())
++                );
++                new WriterHandoffReceiptStore(store, base).persist(report);
++                assertNull(plane.heads().readIndependent("alpha", 0).orElseThrow().ownerNodeId());
++                assertEquals(writerId, plane.heads().readIndependent("alpha", 1).orElseThrow().ownerNodeId());
++                assertTrue(plane.segmentPublisher("alpha", 1).readManifest().isEmpty());
++            }
++            store.failRegisterWritesUnder(null);
++            clock.addAndGet(3 * TTL);
++            final MetadataPlane nextPlane = new MetadataPlane(store, base, clock::get, TTL);
++            try (ServerlessNode successor = new ServerlessNode(nodeSettings("partial-receipt-successor"))) {
++                successor.startup().start();
++                successor.setMetadataPlane(nextPlane);
++                successor.leases().renewLease(nextPlane);
++                nextPlane.membership().refresh();
++                final var readback = new WriterHandoffReceiptStore(store, base).read(writerId, writerEpoch).orElseThrow();
++                assertEquals(1L, readback.releasedCount());
++                assertEquals(Outcome.UNCONFIRMED, readback.shards().get(1).outcome());
++                final ShardId first = successor.activation().activateWriter(nextPlane, "alpha", 0).orElseThrow();
++                final ShardId second = successor.activation().activateWriter(nextPlane, "alpha", 1).orElseThrow();
++                assertTrue(successor.reads().get(first, "d0").found());
++                assertTrue(successor.reads().get(second, "d2").found());
++                assertTrue(successor.writes().index(first, "new-0", "{\"msg\":\"successor\"}").primaryTerm() > firstTerm);
++                assertTrue(successor.writes().index(second, "new-1", "{\"msg\":\"successor\"}").primaryTerm() > secondTerm);
++                assertBusy(() -> {
++                    final var head = nextPlane.heads().readIndependent("alpha", 1).orElseThrow();
++                    assertEquals(successor.localNode().getEphemeralId(), head.ownerEphemeralId());
++                    assertTrue(head.writers().isEmpty());
++                });
++            }
++        }
++    }
++
+ 
+     public void testAssignmentCleanupFailureDoesNotEraseTheAppliedHead() throws Exception {
+         final AtomicLong clock = new AtomicLong(1_000L);

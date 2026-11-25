@@ -1,0 +1,79 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+@@ -95,9 +95,15 @@
+     /** Closes writer admission for the reserved operation and waits for previously admitted opens. */
+     @InternalApi
+     public RetirementState prepareRetirement(String operation) {
++        return prepareRetirement(operation, Long.MAX_VALUE);
++    }
++
++    /** Closes admission only if the dispatch deadline still holds inside the reservation lock. */
++    @InternalApi
++    public RetirementState prepareRetirement(String operation, long prepareBeforeMillis) {
+         synchronized (this) {
+             final RetirementState state = retirementState(operation);
+-            if (state != RetirementState.WITHDRAWN) {
++            if (state != RetirementState.WITHDRAWN || System.currentTimeMillis() >= prepareBeforeMillis) {
+                 return state;
+             }
+             writerAdmissionClosed = true;
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterRetirementHandler.java
+@@ -51,6 +51,7 @@
+         return List.of(
+             new Route(RestRequest.Method.GET, PATH),
+             new Route(RestRequest.Method.POST, PATH),
++            new Route(RestRequest.Method.POST, PATH + "/prepare_before/{deadline_millis}"),
+             new Route(RestRequest.Method.POST, WITHDRAWAL + "{node_id}/{ephemeral_id}/{operation_id}")
+         );
+     }
+@@ -88,6 +89,7 @@
+         }
+         final boolean observing = request.method() == RestRequest.Method.GET;
+         final boolean withdrawing = request.path().startsWith(WITHDRAWAL);
++        final long prepareBeforeMillis = request.paramAsLong("deadline_millis", Long.MAX_VALUE);
+         return channel -> node.threadPool().generic().execute(new AbstractRunnable() {
+             @Override
+             protected void doRun() throws IOException {
+@@ -109,7 +111,16 @@
+                     }
+                     final RetirementState result = observing || withdrawing
+                         ? node.activation().retirementState(operation)
+-                        : node.activation().prepareRetirement(operation);
++                        : node.activation().prepareRetirement(operation, prepareBeforeMillis);
++                    if (observing == false && withdrawing == false && result == RetirementState.WITHDRAWN) {
++                        error(
++                            channel,
++                            RestStatus.SERVICE_UNAVAILABLE,
++                            "writer_prepare_deadline_expired",
++                            "writer preparation deadline expired"
++                        );
++                        return;
++                    }
+                     respond(channel, nodeId, ephemeralId, operation, result);
+                 } else {
+                     respond(channel, nodeId, ephemeralId, operation, state);
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -384,7 +384,17 @@
+             );
+             assertEquals(duringWithdrawal.body(), 201, duringWithdrawal.status());
+ 
+-            final Response prepared = sendAt(client, "POST", path, preparer, null);
++            final Response expired = sendAt(client, "POST", path + "/prepare_before/1", preparer, null);
++            assertEquals(expired.body(), 503, expired.status());
++            assertTrue(expired.body(), expired.body().contains("writer_prepare_deadline_expired"));
++            assertFalse(node.activation().isWriterAdmissionClosed());
++            final Response prepared = sendAt(
++                client,
++                "POST",
++                path + "/prepare_before/" + (System.currentTimeMillis() + 10_000),
++                preparer,
++                null
++            );
+             assertEquals(prepared.body(), 200, prepared.status());
+             assertTrue(prepared.body(), prepared.body().contains("\"state\":\"closed\""));
+             final Response observed = sendAt(client, "GET", path, preparer, null);

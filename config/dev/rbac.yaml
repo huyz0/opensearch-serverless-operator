@@ -1,0 +1,53 @@
+# Development permissions for the current controller.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opensearch-serverless-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensearch-serverless-operator
+rules:
+  - apiGroups: [serverless.opensearch.org]
+    resources: [opensearchserverlesses, opensearchserverlessoperations]
+    verbs: [get, list, watch]
+  - apiGroups: [serverless.opensearch.org]
+    resources: [opensearchserverlesses/status, opensearchserverlessoperations/status]
+    verbs: [get, patch, update]
+  - apiGroups: [serverless.opensearch.org]
+    resources: [opensearchserverlessoperations]
+    verbs: [patch]
+  - apiGroups: ['']
+    resources: [configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: ['']
+    resources: [secrets]
+    verbs: [get, create]
+  - apiGroups: ['']
+    resources: [services]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: ['']
+    resources: [pods/eviction]
+    verbs: [create]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opensearch-serverless-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opensearch-serverless-operator
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-serverless-operator

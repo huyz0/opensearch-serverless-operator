@@ -1,0 +1,175 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+@@ -484,10 +484,22 @@
+      * @param shardId the shard number
+      * @param nodeId the owner
+      * @param expectedTerm the term the owner holds
++     * @param expectedIndexUuid the index incarnation whose WAL was replayed
++     * @param expectedEphemeralId the owning JVM that replayed the WAL
+      * @return true if the head named no other log afterwards
+      * @throws IOException if the register cannot be read or written
+      */
+-    public boolean clearWriters(String indexName, int shardId, String nodeId, long expectedTerm) throws IOException {
++    public boolean clearWriters(
++        String indexName,
++        int shardId,
++        String nodeId,
++        long expectedTerm,
++        String expectedIndexUuid,
++        String expectedEphemeralId
++    ) throws IOException {
++        if (expectedIndexUuid == null || expectedEphemeralId == null) {
++            return false;
++        }
+         final HeadRef ref = ref(indexName, shardId);
+         if (ref.bucketed()) {
+             // The writers a bucket head names are every member's: one member's publish cannot drop them. The bucket's
+@@ -503,7 +515,10 @@
+         try (InputStream in = existing.get().value().streamInput()) {
+             current = ShardHead.fromStream(in);
+         }
+-        if (nodeId.equals(current.ownerNodeId()) == false || current.term() != expectedTerm) {
++        if (nodeId.equals(current.ownerNodeId()) == false
++            || current.term() != expectedTerm
++            || expectedIndexUuid.equals(current.indexUuid()) == false
++            || expectedEphemeralId.equals(current.ownerEphemeralId()) == false) {
+             return false;
+         }
+         if (current.writers().isEmpty()) {
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogWriter.java
+@@ -83,6 +83,7 @@
+ 
+     private final MetadataPlane plane;
+     private final String nodeId;
++    private final String ephemeralId;
+     private final NodeLogStore own;
+     private final List<NodeLogEpoch> inherited;
+     private final NodeLogCommitter committer;
+@@ -98,6 +99,7 @@
+      *
+      * @param plane the metadata plane
+      * @param nodeId this node
++     * @param ephemeralId this JVM incarnation
+      * @param leaseWriter writes this node's lease
+      * @param ownership checks this node's heads
+      * @param windowMillis how long a window stays open
+@@ -109,6 +111,7 @@
+     public static NodeLogWriter start(
+         MetadataPlane plane,
+         String nodeId,
++        String ephemeralId,
+         LeaseWriter leaseWriter,
+         Ownership ownership,
+         long windowMillis,
+@@ -125,12 +128,13 @@
+         for (NodeLogEpoch epoch : inherited) {
+             firstEpoch = Math.max(firstEpoch, epoch.epoch() + 1);
+         }
+-        return new NodeLogWriter(plane, nodeId, own, inherited, firstEpoch, leaseWriter, ownership, windowMillis, maxBytes, maxRecords);
++        return new NodeLogWriter(plane, nodeId, ephemeralId, own, inherited, firstEpoch, leaseWriter, ownership, windowMillis, maxBytes, maxRecords);
+     }
+ 
+     private NodeLogWriter(
+         MetadataPlane plane,
+         String nodeId,
++        String ephemeralId,
+         NodeLogStore own,
+         List<NodeLogEpoch> inherited,
+         long firstEpoch,
+@@ -142,6 +146,7 @@
+     ) {
+         this.plane = Objects.requireNonNull(plane, "plane");
+         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
++        this.ephemeralId = Objects.requireNonNull(ephemeralId, "ephemeralId");
+         this.own = own;
+         this.inherited = List.copyOf(inherited);
+         this.leaseWriter = Objects.requireNonNull(leaseWriter, "leaseWriter");
+@@ -550,7 +555,7 @@
+         final java.util.concurrent.Executor background = this.background;
+         if (background == null) {
+             if (settled(shardId, settle, 1)) {
+-                plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
++                clearPredecessorWAL(shardId, term);
+             }
+             return;
+         }
+@@ -560,7 +565,7 @@
+             background.execute(() -> {
+                 try {
+                     if (settled(shardId, settle, SETTLE_ATTEMPTS)) {
+-                        plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
++                        clearPredecessorWAL(shardId, term);
+                     }
+                 } catch (IOException | RuntimeException e) {
+                     logger.debug(
+@@ -573,6 +578,10 @@
+         } catch (RuntimeException e) {
+             // Shutting down: the head keeps naming them, which costs reads, never records.
+         }
++    }
++
++    private void clearPredecessorWAL(ShardId shardId, long term) throws IOException {
++        plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term, shardId.getIndex().getUUID(), ephemeralId);
+     }
+ 
+     /**
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeLogStart.java
+@@ -51,17 +51,21 @@
+         }
+         synchronized (node) {
+             if (nodeLogWriter == null) {
+-                final NodeLogWriter writer = NodeLogWriter.start(plane, node.localNode.getId(), (epochs, opensEpoch) -> {
+-                    final long validUntil = ownLeaseValidUntilMillis;
+-                    // Only for a new epoch: a renewal is how a lapsed lease comes back, and refusing it left the node
+-                    // unable ever to renew again.
+-                    if (opensEpoch && validUntil != 0L && plane.clock().getAsLong() >= validUntil) {
+-                        // A lapsed lease is renewed only after this node lets go of what it held; recording an epoch is
+-                        // no way around that.
+-                        throw new java.io.IOException("this node's lease has lapsed; no new epoch of its log is recorded");
+-                    }
+-                    writeOwnLease(plane, epochs);
+-                },
++                final NodeLogWriter writer = NodeLogWriter.start(
++                    plane,
++                    node.localNode.getId(),
++                    node.localNode.getEphemeralId(),
++                    (epochs, opensEpoch) -> {
++                        final long validUntil = ownLeaseValidUntilMillis;
++                        // Only for a new epoch: a renewal is how a lapsed lease comes back, and refusing it left the node
++                        // unable ever to renew again.
++                        if (opensEpoch && validUntil != 0L && plane.clock().getAsLong() >= validUntil) {
++                            // A lapsed lease is renewed only after this node lets go of what it held; recording an epoch is
++                            // no way around that.
++                            throw new java.io.IOException("this node's lease has lapsed; no new epoch of its log is recorded");
++                        }
++                        writeOwnLease(plane, epochs);
++                    },
+                     (shardId, term) -> node.leases.ownsAtTerm(plane, shardId, term),
+                     org.opensearch.serverless.nodelog.NodeLogSettings.WINDOW_MILLIS.get(node.settings),
+                     org.opensearch.serverless.nodelog.NodeLogSettings.MAX_BYTES.get(node.settings),
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/NodeLogTakeoverIntegrationTests.java
+@@ -304,9 +304,15 @@
+         assertEquals("b", c.previousOwner());
+         assertEquals(List.of("a", "b"), c.head().writers());
+ 
+-        assertTrue("once c has replayed and published, the head names none", plane.heads().clearWriters("alpha", 0, "c", c.head().term()));
++        assertFalse(plane.heads().clearWriters("alpha", 0, "c", c.head().term(), "previous-uuid", "eph-c"));
++        assertFalse(plane.heads().clearWriters("alpha", 0, "c", c.head().term(), uuid, "previous-jvm"));
++        assertEquals(List.of("a", "b"), plane.heads().read("alpha", 0).orElseThrow().writers());
++        assertTrue(
++            "once c has replayed and published, the head names none",
++            plane.heads().clearWriters("alpha", 0, "c", c.head().term(), uuid, "eph-c")
++        );
+         assertEquals(List.of(), plane.heads().read("alpha", 0).orElseThrow().writers());
+-        assertFalse("only the owner at its term clears them", plane.heads().clearWriters("alpha", 0, "b", c.head().term()));
++        assertFalse("only the owner at its term clears them", plane.heads().clearWriters("alpha", 0, "b", c.head().term(), uuid, "eph-b"));
+         assertTrue(plane.heads().release("alpha", 0, "c", c.head().term(), uuid, "eph-c"));
+         assertEquals(List.of("c"), plane.heads().read("alpha", 0).orElseThrow().writers());
+         assertEquals(

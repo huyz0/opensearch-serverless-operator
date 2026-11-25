@@ -1,0 +1,64 @@
+# Replace the example namespaces, instance, operation and evidence ConfigMap name.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: writer-withdrawal-publisher
+  namespace: operator-platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: writer-observation-reader
+  namespace: operator-platform
+rules:
+  - apiGroups: ['']
+    resources: [configmaps]
+    resourceNames: [writer-observation-report]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: writer-observation-reader
+  namespace: operator-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: writer-observation-reader
+subjects:
+  - kind: ServiceAccount
+    name: writer-withdrawal-publisher
+    namespace: operator-platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: writer-withdrawal-publisher
+  namespace: operator-development
+rules:
+  - apiGroups: [serverless.opensearch.org]
+    resources: [opensearchserverlesses]
+    resourceNames: [catalog]
+    verbs: [get]
+  - apiGroups: [serverless.opensearch.org]
+    resources: [opensearchserverlessoperations]
+    resourceNames: [retire-index-writer]
+    verbs: [get]
+  - apiGroups: ['']
+    resources: [configmaps]
+    resourceNames: [writer-withdrawal-replace-with-operation-hash]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: writer-withdrawal-publisher
+  namespace: operator-development
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: writer-withdrawal-publisher
+subjects:
+  - kind: ServiceAccount
+    name: writer-withdrawal-publisher
+    namespace: operator-platform

@@ -1,0 +1,48 @@
+# Placement, disruptions and traffic
+
+Qualify each mechanism independently before combining it with fixed-capacity, rolling and blue/green deployments. Lease recovery, scheduler behavior and ingress convergence require their own observations. [Placement and recovery](../design/placement-and-recovery.md) · [Traffic and revisions](../design/traffic-and-security.md)
+
+## M05 — Placement and provisioning
+
+**Goal.** Meet declared per-role/AZ targets on shared or dedicated nodes without producing unbounded provisioning demand.
+
+| Task | Prerequisites | Goal and deliverable | Acceptance evidence |
+| --- | --- | --- | --- |
+| M05.01 | M01.03, M04.01 | Resolve platform profiles for each role, including selector, taints, usable AZs, fit envelope and evidence freshness. Implement optional one OpenSearch Pod per host using required anti-affinity and a qualified dedicated profile. | Schedule independent search and indexing profiles into their requested AZs. Reject single-host double placement, stale profiles and ambiguous topology labels. A shared-node deployment works without a dedicated profile. |
+| M05.02 | M05.01 | Fit the admitted Pod and profile using Kubernetes quantity math. Account for app containers, init and native sidecar requests, RuntimeClass overhead, existing node reservations, DaemonSets and Pod/IP slots. | Compare calculated fit to registered allocatable and an actual binding. Inject a DaemonSet, init and RuntimeClass change, and exercise exact-fit and no-fit boundaries. Avoid charging overhead that allocatable already excludes. |
+| M05.03 | M02.03, M05.02 | Bound pending provisionable Pods with gates and persistent slots by group and instance. Track no-progress times, backoff and profile generation. Withdraw only an unbound Pod after revalidating identity and phase. | Reproduce the allocatable prediction mismatch and late registration pattern captured in the Karpenter research. Across restarts and concurrent workers, observe a bounded number of active scheduling requests, blocked retries and late nodes. |
+| M05.04 | M05.03 | Integrate a qualified EKS Karpenter profile. Keep Node/NodeClaim observations optional and isolate any reader in a separate role. | Test dedicated shape fit, actual DaemonSets, missing selectors, startup taints, quota and AZ pressure. The namespaced default recovers or reports a bounded hold without Node/NodeClaim access. |
+| M05.05 | M05.03 | Integrate a GKE Standard managed-node-pool profile and Cluster Autoscaler settings using the same Pod scheduling contract. Qualify the primary store independently of compute. | Test zonal pool expansion, missing pool, quotas and no fit. Prove that an unsupported GCS configuration stays unsupported even when the Kubernetes rollout succeeds. |
+
+**Exit.** Both provider paths have measured fit and bounded demand evidence. [Fit and provisioning guard](../design/placement-and-recovery.md#fit-calculation-and-capacity-evidence) · [Karpenter incidents](../research/karpenter-scheduling-research.md)
+
+## M06 — Warm capacity and disruption
+
+**Goal.** Keep separate, measured reserves for search and indexing, and degrade predictably when a provider or AZ failure outruns replacement capacity.
+
+| Task | Prerequisites | Goal and deliverable | Acceptance evidence |
+| --- | --- | --- | --- |
+| M06.01 | M03.03, M04.04 | Qualify a process-local warm-search signal and writer takeover signal. Trace the warm timeout semantics. If existing endpoints or metrics cannot prove warmth, expose a versioned Java signal and requalify the source. Define when an explicit all-cold policy can admit degraded search. | Warm-up success, timeout, partial copy, no source, stale metrics and same-Pod JVM restart yield different observations. A stale Pod condition never admits the restarted process under strict readiness. |
+| M06.02 | M05.03, M06.01 | Allocate role/AZ reserves and enforce independent budgets for warm-ups, surge, pending Pods and retirements. Define each reserve's counting and activation behavior. | Search and indexing maintain their own phase and floor under warm-up overlap, unavailability and actual lease loss. Exclude the victim and prior committed retirements once each. |
+| M06.03 | M05.04, M05.05, M06.02 | Qualify the platform policies that keep paid-for warm reserves. Test Karpenter consolidation mode and Pod lifetime safe-to-evict policy for GKE separately from upgrades and repairs. | Idle warm Pods remain present during ordinary scale-down evaluation. Eligible empty capacity can consolidate. Exercise forced drains and explain measured protection duration and gaps. No annotation toggle is needed during promotion of a reserve. |
+| M06.04 | M06.02 | Implement namespaced disruption detection and opt-in validated maintenance hints. For cooperative drains, distinguish warming outside the drain scope from observation of an already terminating Pod. | Without a publisher, replenish an already-warm reserve after a Pod/event/lease signal and report timing. With a publisher, acknowledge only confirmed placement outside the drain scope and reject stale or forged intent. Test PDB competition and finite platform drain deadlines. |
+| M06.05 | M06.03, M06.04 | Rehearse abrupt AZ loss and bounded emergency scale-out across survivors. Hold voluntary actions that deepen the shortfall and perform verified failback within availability limits. | With one of three AZs gone, measure peak survivor traffic, p95/p99 latency, cold reads, write handoff, error rate and PDB allowance. Verify both no-fit and successful failback and document the remaining capacity under a second fault. |
+
+**Exit.** Operations distinguishes warm, merely ready and unavailable capacity by role/AZ, with and without cooperative platform hints. [Disruption research](../research/node-disruption-recovery.md)
+
+## M07 — Traffic and fleet revisions
+
+**Goal.** Expose independent search and indexing routes and prove that fleet transitions preserve the data and traffic guarantees for the selected routing mode.
+
+| Task | Prerequisites | Goal and deliverable | Acceptance evidence |
+| --- | --- | --- | --- |
+| M07.01 | M04.04, M06.01 | Bind user or platform-managed ingress hosts or paths to the two stable role Services. Document API overlap and separate client routing policy from native peer forwarding and authorization. | Client probes hit the expected role Service and qualifying targets. A failed Java Pod and a failed ingress Pod are tested separately while production-style keepalive traffic runs. |
+| M07.02 | M07.01 | Qualify ALB to ingress and optional direct ALB target routing as separate paths. Observe EndpointSlices, edge backend health and actual client traffic. Define bounded retries for safe reads and explicit write idempotency. | Across cold start, node loss and retire, capture ALB versus target 5xx and real client failures. Verify fresh connection and existing connection behavior and report residual errors. Enforce different readiness/health evidence for each edge mode. |
+| M07.03 | M04.03, M05.03, M06.02 | Render immutable fleet/POD revisions and roll bounded replacement waves by role and AZ. Detect config, input and image drift using resolved values. | Invalid or stalled revision preserves qualified serving Pods. Same-AZ replacement respects warm signal, floor, surge, and PDB. Test simultaneous scale and rolling inputs. |
+| M07.04 | M07.03, M07.01, M08.01 | Stage blue/green preview on shared storage and require explicit promotion. Validate permitted mixed-fleet Java wire, persistent format, plugin and security compatibility before overlap. | Preview read and bounded write coexist with production. Verify real compatibility using forward paths and a post-candidate-write old-fleet read. Hold an incompatible preview before it can join the peer plane. |
+| M07.05 | M07.04, M07.02 | Commit per-role Service selectors with durable expected mappings and conditional mutations. Observe convergence before success, then retain and retire fleets within budget. | Crash after the first Service switch, resume and roll back a mixed mapping. Inject a concurrent selector edit and stale approval. Production DNS stays stable, routing rollback preserves newer writes, and old Pods retire only after the release conditions. |
+| M07.06 | M07.05 | Add optional rainbow routing with bounded per-role weights on a qualified weighted Gateway or ALB path. Track actual edge observations independently of API patch success. | Verify observed weights within a reviewed sampling tolerance, hold on unhealthy cohort, switch one role at a time and restore committed weights after interruption. Test total capacity and rollback under mixed traffic. |
+| M07.07 | M07.03 | Add a configurable canary wave and pause or resume controls to rolling replacement. Define the qualification period and observed error thresholds before expanding the wave. | Exercise a successful canary, a failed qualification and controller restart while paused. Confirm no additional victim is retired until the canary passes and resume is recorded. |
+| M07.08 | M07.01, M05.01 | Qualify optional same-AZ client endpoint preference on supported Kubernetes and ingress combinations, with fallback to healthy remote-zone endpoints. | Measure endpoint selection with local capacity, no local endpoints and an AZ failure. Show that unsupported routing modes report their actual behavior and that stale endpoint observations do not mark traffic converged. |
+
+**Exit.** Release evidence covers role-specific clients and blue/green by default. Direct ALB and weighted routing each carry their own support qualifier. [Blue/green research](../research/blue-green-deployment.md)

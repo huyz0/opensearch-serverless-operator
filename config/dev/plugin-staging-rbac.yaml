@@ -1,0 +1,21 @@
+# Optional namespaced ConfigMap creation for development OCI plugin staging.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensearch-serverless-plugin-stager
+rules:
+  - apiGroups: ['']
+    resources: [configmaps]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opensearch-serverless-plugin-stager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opensearch-serverless-plugin-stager
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-serverless-operator

@@ -1,0 +1,49 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
+@@ -476,7 +476,7 @@
+             blockCache(builder, serving);
+             localSegments(builder, serving);
+             scheduler(builder, serving);
+-            lease(builder, serving, metadata);
++            lease(builder, metadata);
+             if (includeShards) {
+                 heldShards(builder, serving);
+             }
+@@ -599,27 +599,26 @@
+     }
+ 
+     /**
+-     * This node's own lease, from the membership snapshot it already holds.
++     * This node's own lease, from its last successful publication.
+      *
+      * <p>The number an operator needs before shards vanish: a lease that is about to lapse under a healthy
+      * node is a renewal that is taking too long, and it is invisible until the peers start stealing.
+      */
+-    private static void lease(XContentBuilder builder, NodeContext serving, MetadataPlane metadata) throws IOException {
++    private static void lease(XContentBuilder builder, MetadataPlane metadata) throws IOException {
+         if (metadata == null) {
+             return;
+         }
++        final var membership = metadata.membership();
+         final long now = metadata.clock().getAsLong();
++        final long expiry = membership.ownExpiresAtMillis();
+         builder.startObject("lease");
+-        builder.field("valid_now", metadata.membership().selfLeaseValidAt(now));
+-        final String self = serving.localNode().getId();
+-        for (var lease : metadata.membership().current()) {
+-            if (self.equals(lease.nodeId())) {
+-                builder.field("expires_at_millis", lease.expiresAtMillis());
+-                builder.field("expires_in_millis", lease.expiresAtMillis() - now);
+-            }
++        builder.field("valid_now", expiry == 0L || now < expiry - membership.skewMarginMillis());
++        if (expiry != 0L) {
++            builder.field("expires_at_millis", expiry);
++            builder.field("expires_in_millis", expiry - now);
+         }
+         builder.field("ttl_millis", metadata.leaseTtlMillis());
+-        builder.field("known_nodes", metadata.membership().current().size());
++        builder.field("known_nodes", membership.current().size());
+         builder.endObject();
+     }
+ 

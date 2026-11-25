@@ -1,0 +1,462 @@
+--- /dev/null
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/WriterHandoffReceiptStore.java
+@@ -0,0 +1,162 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ */
++package org.opensearch.serverless.reconcile;
++
++import org.opensearch.common.annotation.InternalApi;
++import org.opensearch.common.blobstore.BlobPath;
++import org.opensearch.common.blobstore.BlobStore;
++import org.opensearch.common.blobstore.ConditionalBlobContainer;
++import org.opensearch.common.io.stream.BytesStreamOutput;
++import org.opensearch.core.common.bytes.BytesReference;
++import org.opensearch.core.index.shard.ShardId;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.Optional;
++import java.util.regex.Pattern;
++
++/** Stores one immutable shutdown receipt per Java process in the instance's object store. */
++@InternalApi
++public final class WriterHandoffReceiptStore {
++    private static final int FORMAT = 1;
++    private static final int MAX_SHARDS = 16_384;
++    private static final int MAX_BYTES = 4 * 1024 * 1024;
++    private static final Pattern PROCESS_ID = Pattern.compile("[A-Za-z0-9_-]{1,128}");
++    private final ConditionalBlobContainer receipts;
++
++    public WriterHandoffReceiptStore(BlobStore store, BlobPath base) {
++        receipts = ConditionalBlobContainer.of(store.blobContainer(base.add("writer-handoffs")));
++    }
++
++    /** Publishes the report once. A retry of the same report succeeds without replacing it. */
++    public void persist(WriterHandoffReport report) throws IOException {
++        final String key = key(report.nodeId(), report.ephemeralId());
++        final BytesReference encoded = encode(report);
++        try {
++            if (receipts.createRegisterIfAbsent(key, encoded).applied()) {
++                return;
++            }
++        } catch (IOException uncertain) {
++            // A transport error can follow a successful write. Accept only an exact readback.
++            try {
++                verifyExisting(key, encoded);
++                return;
++            } catch (IOException readback) {
++                uncertain.addSuppressed(readback);
++                throw uncertain;
++            }
++        }
++        verifyExisting(key, encoded);
++    }
++
++    private void verifyExisting(String key, BytesReference expected) throws IOException {
++        final var existing = receipts.readRegister(key);
++        if (existing.isEmpty() || expected.equals(existing.get().value()) == false) {
++            throw new IOException("writer handoff receipt is missing or differs for this process");
++        }
++    }
++
++    /** Reads only the requested node incarnation. Absence supplies no handoff evidence. */
++    public Optional<WriterHandoffReport> read(String nodeId, String ephemeralId) throws IOException {
++        final var stored = receipts.readRegister(key(nodeId, ephemeralId));
++        if (stored.isEmpty()) {
++            return Optional.empty();
++        }
++        final BytesReference body = stored.get().value();
++        if (body.length() > MAX_BYTES) {
++            throw new IOException("writer handoff receipt exceeds the size limit");
++        }
++        try (var input = body.streamInput()) {
++            if (input.readVInt() != FORMAT
++                || nodeId.equals(input.readString()) == false
++                || ephemeralId.equals(input.readString()) == false) {
++                throw new IOException("writer handoff receipt format or process identity differs");
++            }
++            final int count = input.readVInt();
++            if (count < 0 || count > MAX_SHARDS) {
++                throw new IOException("writer handoff receipt exceeds the shard limit");
++            }
++            final var shards = new ArrayList<ShardResult>(count);
++            final var seen = new HashSet<ShardId>();
++            for (int i = 0; i < count; i++) {
++                final var shard = new ShardId(input);
++                final long term = input.readLong();
++                final var result = new ShardResult(
++                    shard,
++                    term,
++                    input.readBoolean(),
++                    Outcome.valueOf(input.readString()),
++                    input.readBoolean()
++                );
++                validateShard(result, seen);
++                shards.add(result);
++            }
++            if (input.read() != -1) {
++                throw new IOException("writer handoff receipt has trailing bytes");
++            }
++            return Optional.of(new WriterHandoffReport(nodeId, ephemeralId, shards));
++        } catch (IllegalArgumentException malformed) {
++            throw new IOException("malformed writer handoff receipt", malformed);
++        }
++    }
++
++    private static BytesReference encode(WriterHandoffReport report) throws IOException {
++        final var shards = new ArrayList<>(report.shards());
++        if (shards.size() > MAX_SHARDS) {
++            throw new IOException("writer handoff receipt exceeds the shard limit");
++        }
++        shards.sort(
++            Comparator.comparing((ShardResult shard) -> shard.shard().getIndexName())
++                .thenComparing(shard -> shard.shard().getIndex().getUUID())
++                .thenComparingInt(shard -> shard.shard().id())
++        );
++        final var seen = new HashSet<ShardId>();
++        try (var output = new BytesStreamOutput()) {
++            output.writeVInt(FORMAT);
++            output.writeString(report.nodeId());
++            output.writeString(report.ephemeralId());
++            output.writeVInt(shards.size());
++            for (ShardResult result : shards) {
++                validateShard(result, seen);
++                result.shard().writeTo(output);
++                output.writeLong(result.term());
++                output.writeBoolean(result.hibernated());
++                output.writeString(result.outcome().name());
++                output.writeBoolean(result.localCleanupComplete());
++                if (output.size() > MAX_BYTES) {
++                    throw new IOException("writer handoff receipt exceeds the size limit");
++                }
++            }
++            return output.bytes();
++        }
++    }
++
++    private static void validateShard(ShardResult result, HashSet<ShardId> seen) throws IOException {
++        final ShardId shard = result.shard();
++        if (shard.id() < 0 || shard.getIndexName().isEmpty() || shard.getIndex().getUUID().isEmpty() || seen.add(shard) == false) {
++            throw new IOException("writer handoff receipt includes an invalid or duplicate shard");
++        }
++        if (result.term() < -1 || (result.term() == -1 && result.outcome() != Outcome.UNCONFIRMED)) {
++            throw new IOException("writer handoff receipt includes an invalid term for the recorded outcome");
++        }
++    }
++
++    private static String key(String nodeId, String ephemeralId) {
++        if (nodeId == null
++            || PROCESS_ID.matcher(nodeId).matches() == false
++            || ephemeralId == null
++            || PROCESS_ID.matcher(ephemeralId).matches() == false) {
++            throw new IllegalArgumentException("writer handoff receipt requires exact node and ephemeral process IDs");
++        }
++        return nodeId + "." + ephemeralId;
++    }
++}
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeSettings.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/NodeSettings.java
+@@ -68,6 +68,13 @@
+     public static final Setting<Long> LEASE_TTL_MILLIS = Setting.longSetting(
+         "serverless.lease.ttl_millis",
+         NodeSettings.DEFAULT_LEASE_TTL_MILLIS,
++        Property.NodeScope
++    );
++
++    /** Persists writer handoff evidence on orderly shutdown. */
++    public static final Setting<Boolean> PERSIST_WRITER_HANDOFF = Setting.boolSetting(
++        "serverless.writer_handoff.persist_on_shutdown",
++        false,
+         Property.NodeScope
+     );
+ 
+@@ -159,6 +166,7 @@
+             REQUIRE_SECURE_TRANSPORT,
+             TRANSPORT_ADVERTISE_HOST,
+             LEASE_TTL_MILLIS,
++            PERSIST_WRITER_HANDOFF,
+             HEAD_VERIFY_INTERVAL_MILLIS,
+             DESCRIPTOR_REFRESH_INTERVAL_MILLIS,
+             JANITOR_INTERVAL_MILLIS,
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
+@@ -19,6 +19,8 @@
+ import org.opensearch.serverless.nodelog.NodeLogCommitter;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
+ import org.opensearch.serverless.reconcile.ReconcileScheduler;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
++import org.opensearch.serverless.reconcile.WriterHandoffReport;
+ import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
+ import org.opensearch.serverless.warm.SearchDrain;
+ import org.opensearch.serverless.warm.SearchWarmup;
+@@ -119,19 +121,23 @@
+     private final BackgroundReconciler loop;
+     private final ReconcileScheduler scheduler;
+     private final org.opensearch.serverless.store.ObjectStoreHandle store;
++    private final WriterHandoffReceiptStore handoffReceipts;
++    private boolean closed;
+ 
+     private ServerlessBootstrap(
+         ServerlessNode node,
+         MetadataPlane plane,
+         BackgroundReconciler loop,
+         ReconcileScheduler scheduler,
+-        org.opensearch.serverless.store.ObjectStoreHandle store
++        org.opensearch.serverless.store.ObjectStoreHandle store,
++        WriterHandoffReceiptStore handoffReceipts
+     ) {
+         this.node = node;
+         this.plane = plane;
+         this.loop = loop;
+         this.scheduler = scheduler;
+         this.store = store;
++        this.handoffReceipts = handoffReceipts;
+     }
+ 
+     /**
+@@ -302,7 +308,10 @@
+                     )
+                 )
+             );
+-            return new ServerlessBootstrap(node, plane, loop, scheduler, store);
++            final WriterHandoffReceiptStore receipts = NodeSettings.PERSIST_WRITER_HANDOFF.get(complete)
++                ? new WriterHandoffReceiptStore(store.blobStore(), BlobPath.cleanPath())
++                : null;
++            return new ServerlessBootstrap(node, plane, loop, scheduler, store, receipts);
+         } catch (Exception | Error failure) {
+             // Stop every producer before releasing the address-book entry, keeping the store open until last.
+             closeAfterFailedStart(failure, openedScheduler, openedLoop, node);
+@@ -405,7 +414,12 @@
+      * quiescent.
+      */
+     @Override
+-    public void close() {
++    public synchronized void close() {
++        // A shutdown pass consumes local writer state. Run it once per process.
++        if (closed) {
++            return;
++        }
++        closed = true;
+         // First, while the node still runs: a search node that drains hands its warm shards to its peers before it goes.
+         if (SearchDrain.onShutdown(node)) {
+             SearchDrain.drain(node, plane);
+@@ -416,10 +430,11 @@
+         scheduler.close();
+         // Split completion can open a writer outside the reconciliation scheduler.
+         node.activation().closeWriterAdmission();
++        WriterHandoffReport handoff = null;
+         try {
+             // Publish and release what this node owns, so its shards are claimable at a fresh term the
+             // moment a peer or this node's own restart wants them.
+-            final var handoff = loop.handOverWriters();
++            handoff = loop.handOverWriters();
+             final long handed = handoff.releasedCount();
+             if (handoff.shards().isEmpty() == false) {
+                 final long withWal = handoff.shards().stream().filter(result -> result.outcome() == Outcome.RELEASED_WITH_WAL).count();
+@@ -449,6 +464,13 @@
+                 "Lease release failed. Peers will consider this node live until expiry (error_type={})",
+                 e.getClass().getSimpleName()
+             );
++        }
++        if (handoffReceipts != null && handoff != null) {
++            try {
++                handoffReceipts.persist(handoff);
++            } catch (Exception e) {
++                logger.warn("Could not persist writer handoff receipt (error_type={})", e.getClass().getSimpleName());
++            }
+         }
+         node.close();
+         try {
+--- /dev/null
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHandoffReceiptStoreTests.java
+@@ -0,0 +1,64 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ */
++package org.opensearch.serverless.testkit;
++
++import org.opensearch.common.blobstore.BlobPath;
++import org.opensearch.common.blobstore.ConditionalBlobContainer;
++import org.opensearch.common.blobstore.fs.FsBlobStore;
++import org.opensearch.core.common.bytes.BytesArray;
++import org.opensearch.core.index.shard.ShardId;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
++import org.opensearch.serverless.reconcile.WriterHandoffReport;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
++import org.opensearch.test.OpenSearchTestCase;
++
++import java.io.IOException;
++import java.util.List;
++
++public class WriterHandoffReceiptStoreTests extends OpenSearchTestCase {
++    public void testLostCreateResponseIsVerifiedAndRetryCannotReplaceReceipt() throws Exception {
++        try (
++            var store = new CrashPointBlobStore(new FsBlobStore(8192, createTempDir(), false)).on(
++                step -> step.kind() == CrashPointBlobStore.Kind.CREATE_REGISTER,
++                CrashPointBlobStore.Fault.AMBIGUOUS,
++                1
++            )
++        ) {
++            final var receipts = new WriterHandoffReceiptStore(store, BlobPath.cleanPath());
++            final var first = new ShardResult(new ShardId("logs", "uuid-logs", 0), 3L, false, Outcome.RELEASED_WITH_WAL, false);
++            final var second = new ShardResult(new ShardId("logs", "uuid-logs", 1), 5L, true, Outcome.UNCONFIRMED, false);
++            final var expected = new WriterHandoffReport("node", "old-process", List.of(first, second));
++            receipts.persist(new WriterHandoffReport("node", "old-process", List.of(second, first)));
++            assertEquals(expected, receipts.read("node", "old-process").orElseThrow());
++            receipts.persist(expected);
++            expectThrows(IOException.class, () -> receipts.persist(new WriterHandoffReport("node", "old-process", List.of())));
++            assertEquals(expected, receipts.read("node", "old-process").orElseThrow());
++            assertTrue(receipts.read("node", "new-process").isEmpty());
++        }
++    }
++
++    public void testUnknownFormatSuppliesNoReceipt() throws Exception {
++        try (var store = new FsBlobStore(8192, createTempDir(), false)) {
++            final BlobPath base = BlobPath.cleanPath();
++            final var container = ConditionalBlobContainer.of(store.blobContainer(base.add("writer-handoffs")));
++            assertTrue(container.createRegisterIfAbsent("node.process", new BytesArray(new byte[] { 2 })).applied());
++            final var receipts = new WriterHandoffReceiptStore(store, base);
++            expectThrows(IOException.class, () -> receipts.read("node", "process"));
++        }
++    }
++
++    public void testConfirmedReleaseRequiresAKnownTerm() throws Exception {
++        try (var store = new FsBlobStore(8192, createTempDir(), false)) {
++            final var receipts = new WriterHandoffReceiptStore(store, BlobPath.cleanPath());
++            final var invalid = new ShardResult(new ShardId("logs", "uuid-logs", 0), -1L, false, Outcome.RELEASED, false);
++            expectThrows(IOException.class, () -> receipts.persist(new WriterHandoffReport("node", "process", List.of(invalid))));
++            assertTrue(receipts.read("node", "process").isEmpty());
++        }
++    }
++}
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessBootstrapTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessBootstrapTests.java
+@@ -8,7 +8,14 @@
+ 
+ package org.opensearch.serverless.testkit;
+ 
++import org.opensearch.common.blobstore.BlobPath;
++import org.opensearch.common.blobstore.fs.FsBlobStore;
+ import org.opensearch.common.settings.Settings;
++import org.opensearch.common.xcontent.XContentHelper;
++import org.opensearch.common.xcontent.XContentType;
++import org.opensearch.core.common.bytes.BytesArray;
++import org.opensearch.serverless.node.NodeSettings;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
+ import org.opensearch.serverless.shell.ServerlessBootstrap;
+ import org.opensearch.test.OpenSearchTestCase;
+ 
+@@ -223,6 +230,42 @@
+         // not shutdown did anything -- the first version of this test did exactly that, and was
+         // measuring the clock rather than the code.
+         assertTrue("a clean shutdown must drop the lease, not leave peers waiting out its TTL", plane.membership().read(nodeId).isEmpty());
++    }
++
++    public void testShutdownReceiptCanBeReadAfterTheWriterCloses() throws Exception {
++        final var directory = createTempDir();
++        final Settings settings = Settings.builder()
++            .put(bootSettings("receipt-writer", directory))
++            .put(NodeSettings.PERSIST_WRITER_HANDOFF.getKey(), true)
++            .put(NodeSettings.LEASE_TTL_MILLIS.getKey(), 30_000L)
++            .build();
++        final String nodeId;
++        final String ephemeralId;
++        final long term;
++        try (ServerlessBootstrap boot = ServerlessBootstrap.start(settings)) {
++            final var http = boot.node().boundHttpAddress().publishAddress();
++            assertEquals(200, send(http, "PUT", "/alpha?shards=1", MAPPING).status());
++            assertEquals(201, send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"persisted\"}").status());
++            final Response stats = send(http, "GET", "/_serverless/stats", null);
++            assertEquals(200, stats.status());
++            final var fields = XContentHelper.convertToMap(new BytesArray(stats.body()), false, XContentType.JSON).v2();
++            final var local = boot.node().localNode();
++            nodeId = (String) fields.get("node");
++            ephemeralId = (String) fields.get("node_ephemeral_id");
++            assertEquals(local.getId(), nodeId);
++            assertEquals(local.getEphemeralId(), ephemeralId);
++            term = boot.plane().heads().read("alpha", 0).orElseThrow().term();
++            // The resource cleanup also calls close. The first shutdown owns the receipt.
++            boot.close();
++        }
++        // Open a separate store handle after the runtime has closed its own handle.
++        try (var observer = new FsBlobStore(8192, directory, false)) {
++            final var receipt = new WriterHandoffReceiptStore(observer, BlobPath.cleanPath()).read(nodeId, ephemeralId).orElseThrow();
++            assertEquals(1, receipt.shards().size());
++            assertEquals(1L, receipt.releasedCount());
++            assertEquals("alpha", receipt.shards().getFirst().shard().getIndexName());
++            assertEquals(term, receipt.shards().getFirst().term());
++        }
+     }
+ 
+     private record Response(int status, String body) {
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
+@@ -356,6 +356,7 @@
+         throws IOException {
+         {
+             builder.field("node", serving.localNode().getId());
++            builder.field("node_ephemeral_id", serving.localNode().getEphemeralId());
+             builder.field("name", serving.localNode().getName());
+             builder.field("process_incarnation", SearchReadiness.of(serving).warmupSnapshot().incarnation());
+ 
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/MinioBlobContainerConformanceTests.java
+@@ -16,14 +16,21 @@
+ import org.opensearch.common.blobstore.ConditionalBlobContainer;
+ import org.opensearch.core.common.bytes.BytesArray;
+ import org.opensearch.core.common.bytes.BytesReference;
++import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.repositories.s3.MinioBlobStores;
+-
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
++import org.opensearch.serverless.reconcile.WriterHandoffReport;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
++
++import java.io.IOException;
+ import java.net.URI;
+ import java.net.http.HttpClient;
+ import java.net.http.HttpRequest;
+ import java.net.http.HttpResponse;
+ import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.List;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -108,6 +115,21 @@
+         container.deleteBlobsIgnoringIfNotExists(java.util.List.of("large-source", "large-copy"));
+     }
+ 
++    public void testWriterHandoffReceiptCannotBeReplaced() throws Exception {
++        final BlobContainer fixture = newContainer();
++        try (var backing = store()) {
++            final var receipts = new WriterHandoffReceiptStore(backing, fixture.path());
++            final var shard = new ShardResult(new ShardId("logs", "uuid-logs", 0), 3L, false, Outcome.RELEASED_WITH_WAL, false);
++            final var first = new WriterHandoffReport("node", "original-process", List.of(shard));
++            receipts.persist(first);
++            receipts.persist(first);
++            final var conflict = new WriterHandoffReport(first.nodeId(), first.ephemeralId(), List.of());
++            expectThrows(IOException.class, () -> receipts.persist(conflict));
++            assertEquals(first, receipts.read(first.nodeId(), first.ephemeralId()).orElseThrow());
++            assertTrue(receipts.read(first.nodeId(), "replacement-process").isEmpty());
++        }
++    }
++
+     private org.opensearch.common.blobstore.BlobStore lastStore;
+ 
+     @Override

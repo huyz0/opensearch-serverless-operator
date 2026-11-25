@@ -1,0 +1,16 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/StatsHandler.java
+@@ -32,4 +32,5 @@
+ import org.opensearch.serverless.node.Capacity;
+ import org.opensearch.serverless.node.FleetSize;
+ import org.opensearch.serverless.node.NodeContext;
++import org.opensearch.serverless.node.SearchReadiness;
+ import org.opensearch.serverless.ops.Fanout;
+@@ -453,5 +454,6 @@
+             builder.field("node", serving.localNode().getId());
+             builder.field("name", serving.localNode().getName());
++            builder.field("process_incarnation", SearchReadiness.of(serving).warmupSnapshot().incarnation());
+ 
+             final var shards = serving.reconciler().shardCounts();
+             builder.startObject("shards");

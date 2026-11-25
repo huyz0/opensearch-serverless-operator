@@ -1,0 +1,23 @@
+# Apply in the instance namespace after setting resourceNames to the two
+# HTTPRoutes configured on the operator deployment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensearch-serverless-weighted-rollout
+rules:
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
+    resourceNames: [catalog-search, catalog-index]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opensearch-serverless-weighted-rollout
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opensearch-serverless-weighted-rollout
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-serverless-operator

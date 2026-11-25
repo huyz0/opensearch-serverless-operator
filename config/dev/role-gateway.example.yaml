@@ -1,0 +1,58 @@
+# Apply in the instance namespace after the platform has created the Gateway.
+# Use a listener isolated for development that permits HTTPRoutes from this namespace.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: catalog-search
+spec:
+  parentRefs:
+    - name: development
+      namespace: gateway-system
+      sectionName: http
+  hostnames: [search.example.com]
+  rules:
+    - backendRefs:
+        - name: catalog-search
+          port: 9200
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: catalog-index
+spec:
+  parentRefs:
+    - name: development
+      namespace: gateway-system
+      sectionName: http
+  hostnames: [index.example.com]
+  rules:
+    - backendRefs:
+        - name: catalog-index
+          port: 9200
+---
+# Envoy Gateway extension for the plaintext development runtime.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: catalog-backend-health
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: catalog-search
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: catalog-index
+  routingType: Endpoint
+  healthCheck:
+    # Return an unavailable response if all endpoints for a role are unhealthy.
+    panicThreshold: 0
+    active:
+      type: HTTP
+      http:
+        path: /_serverless/ready
+        expectedStatuses: [200]
+      interval: 1s
+      timeout: 600ms
+      unhealthyThreshold: 2
+      healthyThreshold: 2

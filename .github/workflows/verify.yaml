@@ -1,0 +1,75 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l $(find api pkg internal cmd -name '*.go'))
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Verify generated CRDs and API deep copies
+        run: |
+          go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.3 object crd paths=./api/v1alpha1 output:crd:artifacts:config=config/generated-dev
+          git diff --exit-code -- api/v1alpha1/zz_generated.deepcopy.go config/generated-dev
+      - name: Verify Pod lifecycle package dependencies
+        run: |
+          dependencies=$(go list -mod=readonly -deps ./pkg/podlifecycle/...)
+          if grep -E '^opensearch-serverless-operator/(api|cmd|internal)(/|$)' <<< "$dependencies"; then
+            echo 'The Pod lifecycle package depends on operator-specific code.'
+            exit 1
+          fi
+      - name: Unit and race tests
+        run: go test -race ./api/... ./pkg/... ./internal/... ./cmd/...
+      - name: Plan verification
+        run: |
+          python tools/verify_plan.py
+          python tools/test_verify_plan.py
+
+  development-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check release tooling
+        run: |
+          kubectl version --client
+          openssl version
+          python3 --version
+      - name: Verify signed packages and rollout observations
+        run: |
+          python3 tools/test_package_development_release.py
+          python3 tools/test_observe_development_release.py
+          python3 tools/test_release_sbom.py
+      - name: Exercise admission, controllers, and releases on isolated API servers
+        run: |
+          test_assets="$RUNNER_TEMP/release-envtest"
+          mkdir -p "$test_assets"
+          archive="$test_assets/envtest-v1.32.0-linux-amd64.tar.gz"
+          curl --fail --location --retry 3 --max-time 120 \
+            --output "$archive" \
+            https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-v1.32.0/envtest-v1.32.0-linux-amd64.tar.gz
+          checksum=3a9584af30d041c42893d8f7a860aa434976d4aee479cf2e9a50a9e5677dcc83d3012a2146a6feb5b2e95a7b3c6f657ae9c591745981262da8b06e4b61dcdf17
+          printf '%s  %s\n' "$checksum" "$archive" | sha512sum --check -
+          tar -xzf "$archive" -C "$test_assets"
+          export KUBEBUILDER_ASSETS="$test_assets/controller-tools/envtest"
+          export PATH="$KUBEBUILDER_ASSETS:$PATH"
+          go test -mod=readonly -count=1 -tags envtest ./internal/controller ./pkg/podlifecycle/kubernetes ./tools/releasecheck ./cmd/rollout-evidence-publisher

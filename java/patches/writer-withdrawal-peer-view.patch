@@ -1,0 +1,404 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java b/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/membership/BlobLeaseMembership.java
+@@ -110,6 +110,8 @@
+     private final List<Consumer<MembershipDelta>> listeners = new CopyOnWriteArrayList<>();
+ 
+     private volatile Set<NodeLease> observed = Set.of();
++    private final Object snapshotPublication = new Object();
++    private final java.util.Map<WriterProcess, NodeLease> observedWithdrawals = new java.util.HashMap<>();
+     private volatile long lastRefreshedAt = Long.MIN_VALUE;
+     private volatile long lastIndexGeneration = BlobRegister.ABSENT_GENERATION;
+     private final Set<String> enrollmentSwaps = java.util.concurrent.ConcurrentHashMap.newKeySet();
+@@ -693,6 +695,45 @@
+     private record Member(String nodeId, String ephemeralId, String address, Set<String> roles, boolean revoked) {
+         static Member of(NodeLease lease) {
+             return new Member(lease.nodeId(), lease.ephemeralId(), lease.address(), lease.roles(), lease.revoked());
++        }
++    }
++
++    private record WriterProcess(String nodeId, String ephemeralId) {
++        static WriterProcess of(NodeLease lease) {
++            return new WriterProcess(lease.nodeId(), lease.ephemeralId());
++        }
++    }
++
++    private record PublishedSnapshot(Set<NodeLease> previous, Set<NodeLease> current) {
++    }
++
++    private PublishedSnapshot publishSnapshot(Set<NodeLease> live) {
++        synchronized (snapshotPublication) {
++            final long now = clock.getAsLong();
++            observedWithdrawals.values().removeIf(lease -> lease.isExpiredAt(now));
++            for (NodeLease lease : live) {
++                if (lease.writerTrafficWithdrawn() && lease.isExpiredAt(now) == false) {
++                    observedWithdrawals.merge(
++                        WriterProcess.of(lease),
++                        lease,
++                        (known, incoming) -> incoming.expiresAtMillis() > known.expiresAtMillis() ? incoming : known
++                    );
++                }
++            }
++            // A concurrent refresh or a digest can still carry a pre-withdrawal copy. Once the marker
++            // has been visible here, keep excluding that exact process through its marked lease expiry.
++            Set<NodeLease> effective = live;
++            if (observedWithdrawals.isEmpty() == false) {
++                effective = new LinkedHashSet<>();
++                for (NodeLease lease : live) {
++                    effective.add(
++                        lease.writerTrafficWithdrawn() ? lease : observedWithdrawals.getOrDefault(WriterProcess.of(lease), lease)
++                    );
++                }
++            }
++            final var snapshot = new PublishedSnapshot(observed, Set.copyOf(effective));
++            observed = snapshot.current();
++            return snapshot;
+         }
+     }
+ 
+@@ -846,19 +887,21 @@
+         }
+         lastRead.keySet().retainAll(ids);
+         lastRefreshedAt = now;
++        final PublishedSnapshot snapshot = publishSnapshot(live);
+         if (writingDigest) {
+-            writeDigest(live, now);
+-        }
+-
+-        final Set<NodeLease> previous = observed;
++            writeDigest(snapshot.current(), now);
++        }
++
++        final Set<NodeLease> previous = snapshot.previous();
++        final Set<NodeLease> current = snapshot.current();
+         // By member, not by lease: a renewal moves only the expiry, and a lease compared whole made every renewal read
+         // here a departure and a join of the same live process, about once a lifetime per peer.
+         final Set<Member> liveMembers = new HashSet<>();
+-        live.forEach(lease -> liveMembers.add(Member.of(lease)));
++        current.forEach(lease -> liveMembers.add(Member.of(lease)));
+         final Set<Member> previousMembers = new HashSet<>();
+         previous.forEach(lease -> previousMembers.add(Member.of(lease)));
+         final Set<NodeLease> joined = new HashSet<>();
+-        for (NodeLease lease : live) {
++        for (NodeLease lease : current) {
+             if (previousMembers.contains(Member.of(lease)) == false) {
+                 joined.add(lease);
+             }
+@@ -869,8 +912,6 @@
+                 left.add(lease);
+             }
+         }
+-        observed = Set.copyOf(live);
+-
+         final MembershipDelta delta = new MembershipDelta(joined, left);
+         if (delta.isEmpty() == false) {
+             for (Consumer<MembershipDelta> listener : listeners) {
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterWithdrawalViewHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterWithdrawalViewHandler.java
+new file mode 100644
+--- /dev/null
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterWithdrawalViewHandler.java
+@@ -0,0 +1,134 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ */
++package org.opensearch.serverless.rest;
++
++import org.opensearch.core.rest.RestStatus;
++import org.opensearch.http.netty4.ssl.SecureNetty4HttpServerTransport;
++import org.opensearch.identity.NamedPrincipal;
++import org.opensearch.rest.BaseRestHandler;
++import org.opensearch.rest.BytesRestResponse;
++import org.opensearch.rest.RestChannel;
++import org.opensearch.rest.RestRequest;
++import org.opensearch.serverless.node.NodeContext;
++import org.opensearch.serverless.reconcile.WriterHandoffReceiptStore;
++import org.opensearch.serverless.restcore.RestReplies;
++import org.opensearch.transport.client.node.NodeClient;
++
++import java.io.IOException;
++import java.security.Principal;
++import java.util.List;
++import java.util.function.Supplier;
++
++/** Reports a writer withdrawal from this process's current placement view. */
++public final class WriterWithdrawalViewHandler extends BaseRestHandler {
++    private static final String PATH =
++        "/_serverless/writer_withdrawal_view/{node_id}/{ephemeral_id}/{writer_node_id}/{writer_ephemeral_id}";
++    private final NodeContext node;
++    private final Supplier<Principal> principal;
++    private final String reader;
++
++    public WriterWithdrawalViewHandler(NodeContext node, Supplier<Principal> principal, String reader) {
++        this.node = node;
++        this.principal = principal;
++        this.reader = reader;
++    }
++
++    @Override
++    public String getName() {
++        return "serverless_writer_withdrawal_view";
++    }
++
++    @Override
++    public List<Route> routes() {
++        return List.of(new Route(RestRequest.Method.GET, PATH));
++    }
++
++    @Override
++    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
++        final String nodeId = request.param("node_id");
++        final String ephemeralId = request.param("ephemeral_id");
++        final String writerId = request.param("writer_node_id");
++        final String writerEpoch = request.param("writer_ephemeral_id");
++        final Principal caller = principal.get();
++        if (caller == null
++            || NamedPrincipal.UNAUTHENTICATED.getName().equals(caller.getName())
++            || reader.equals(caller.getName()) == false) {
++            return channel -> error(channel, RestStatus.FORBIDDEN, "not_permitted", "caller is not the configured writer handoff reader");
++        }
++        if (node.httpServerTransport instanceof SecureNetty4HttpServerTransport == false) {
++            return channel -> error(channel, RestStatus.FORBIDDEN, "writer_withdrawal_view_requires_tls", "withdrawal views require HTTPS");
++        }
++        if (WriterHandoffReceiptStore.isProcessId(nodeId) == false
++            || WriterHandoffReceiptStore.isProcessId(ephemeralId) == false
++            || WriterHandoffReceiptStore.isProcessId(writerId) == false
++            || WriterHandoffReceiptStore.isProcessId(writerEpoch) == false
++            || nodeId.equals(writerId)) {
++            return channel -> error(
++                channel,
++                RestStatus.BAD_REQUEST,
++                "invalid_process_identity",
++                "distinct observer and writer IDs are required"
++            );
++        }
++        final var metadata = node.metadataPlane();
++        if (node.isStarted() == false || metadata == null) {
++            return channel -> error(
++                channel,
++                RestStatus.SERVICE_UNAVAILABLE,
++                "writer_withdrawal_view_unavailable",
++                "placement view unavailable"
++            );
++        }
++        final var local = node.localNode();
++        if (nodeId.equals(local.getId()) == false || ephemeralId.equals(local.getEphemeralId()) == false) {
++            return channel -> error(channel, RestStatus.CONFLICT, "observer_process_changed", "target does not identify this Java process");
++        }
++        return channel -> {
++            final long now = metadata.clock().getAsLong();
++            // Use the same cached view as cold placement. Reading the store here would confirm publication only.
++            final long remaining = metadata.membership()
++                .current()
++                .stream()
++                .filter(
++                    lease -> writerId.equals(lease.nodeId())
++                        && writerEpoch.equals(lease.ephemeralId())
++                        && lease.isExpiredAt(now) == false
++                        && lease.roles().contains(NodeContext.ROLE_INGEST)
++                        && lease.writerTrafficWithdrawn()
++                )
++                .mapToLong(lease -> lease.expiresAtMillis() - now)
++                .findFirst()
++                .orElse(0L);
++            try (var content = channel.newBuilder()) {
++                content.startObject();
++                content.field("version", 1);
++                content.startObject("observer");
++                content.field("node_id", local.getId());
++                content.field("ephemeral_id", local.getEphemeralId());
++                content.endObject();
++                content.startObject("writer");
++                content.field("node_id", writerId);
++                content.field("ephemeral_id", writerEpoch);
++                content.endObject();
++                content.field("withdrawn", remaining > 0L);
++                content.field("lease_remaining_millis", remaining);
++                content.endObject();
++                send(channel, new BytesRestResponse(RestStatus.OK, content));
++            }
++        };
++    }
++
++    private static void error(RestChannel channel, RestStatus status, String type, String reason) throws IOException {
++        send(channel, RestReplies.error(channel, status, type, reason));
++    }
++
++    private static void send(RestChannel channel, BytesRestResponse response) {
++        response.addHeader("Cache-Control", "no-store");
++        channel.sendResponse(response);
++    }
++}
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java b/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/NodeWiring.java
+@@ -20,6 +20,7 @@
+ import org.opensearch.serverless.rest.ServerlessRootHandler;
+ import org.opensearch.serverless.rest.WriterHandoffReceiptHandler;
+ import org.opensearch.serverless.rest.WriterRetirementHandler;
++import org.opensearch.serverless.rest.WriterWithdrawalViewHandler;
+ import org.opensearch.serverless.warm.SearchDrain;
+ import org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry;
+ import org.opensearch.usage.UsageService;
+@@ -102,6 +103,15 @@
+         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> node, () -> node.metadataPlane())));
+         final String handoffReader = NodeSettings.WRITER_HANDOFF_READER.get(node.settings());
+         if (handoffReader.isBlank() == false && node.plugins().filter(IdentityPlugin.class).isEmpty() == false) {
++            controller.registerHandler(
++                guarded.apply(
++                    new WriterWithdrawalViewHandler(
++                        node,
++                        () -> node.services().identityService().getCurrentSubject().getPrincipal(),
++                        handoffReader
++                    )
++                )
++            );
+             controller.registerHandler(
+                 guarded.apply(
+                     new WriterHandoffReceiptHandler(
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BlobLeaseMembershipTests.java
+@@ -41,6 +41,48 @@
+ 
+     private static NodeLease lease(String id, String... roles) {
+         return new NodeLease(id, id + "-eph", "127.0.0.1:9300", Set.of(roles), 0L);
++    }
++
++    public void testLateRefreshCannotRestoreWriterEligibilityAfterWithdrawalWasObserved() throws Exception {
++        final AtomicLong now = new AtomicLong(1_000L);
++        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
++            final var container = store.blobContainer(BlobPath.cleanPath());
++            final var observer = new BlobLeaseMembership(container, now::get, TTL);
++            final var writer = new BlobLeaseMembership(container, now::get, TTL);
++            final var last = new BlobLeaseMembership(container, now::get, TTL);
++            observer.renew(lease("a-observer", "ingest"));
++            writer.renew(lease("b-writer", "ingest"));
++            last.renew(lease("z-last", "search"));
++
++            // The older refresh has already read b-writer when it enters the read of z-last.
++            store.onNextRegisterRead("", BlobLeaseMembership.LEASE_PREFIX + "z-last", () -> {
++                try {
++                    writer.renew(lease("b-writer", "ingest", NodeLease.WRITER_TRAFFIC_WITHDRAWN));
++                    observer.refresh();
++                    assertTrue(
++                        observer.current().stream().anyMatch(lease -> lease.nodeId().equals("b-writer") && lease.writerTrafficWithdrawn())
++                    );
++                } catch (java.io.IOException e) {
++                    throw new AssertionError(e);
++                }
++            });
++            observer.refresh();
++            assertTrue(store.fired());
++            final NodeLease seen = observer.current().stream().filter(lease -> lease.nodeId().equals("b-writer")).findFirst().orElseThrow();
++            assertTrue(seen.writerTrafficWithdrawn());
++            assertFalse(seen.acceptsNewWriters());
++
++            now.addAndGet(TTL / 3 + 1);
++            writer.renew(new NodeLease("b-writer", "replacement", seen.address(), Set.of("ingest"), 0L));
++            observer.refresh();
++            final NodeLease replacement = observer.current()
++                .stream()
++                .filter(lease -> lease.nodeId().equals("b-writer"))
++                .findFirst()
++                .orElseThrow();
++            assertEquals("replacement", replacement.ephemeralId());
++            assertTrue(replacement.acceptsNewWriters());
++        }
+     }
+ 
+     public void testNonpositiveLeaseTtlIsRefused() throws Exception {
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -32,6 +32,7 @@
+ import org.opensearch.serverless.auth.PasswordHash;
+ import org.opensearch.serverless.auth.ServerlessAuthPlugin;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
++import org.opensearch.serverless.membership.NodeLease;
+ import org.opensearch.serverless.metadata.MetadataPlane;
+ import org.opensearch.serverless.node.NodeSettings;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
+@@ -48,6 +49,7 @@
+ import java.time.Duration;
+ import java.util.Base64;
+ import java.util.List;
++import java.util.Set;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.function.Supplier;
+@@ -224,6 +226,71 @@
+             assertTrue(inventory.body(), inventory.body().contains("\"index_uuid\":\"uuid-orphan\""));
+             assertTrue(inventory.body(), inventory.body().contains("\"owner_ephemeral_id\":\"old-process\""));
+             assertTrue(inventory.body(), inventory.body().contains("\"next_after\":null"));
++        }
++    }
++
++    public void testWriterWithdrawalViewReportsTheObserverSnapshot() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = plane(clock);
++        final var writer = new MetadataPlane(plane.blobStore(), BlobPath.cleanPath(), clock::get, TTL);
++        final var writerLease = new NodeLease("writer", "writer-process", "127.0.0.1:9300", Set.of("ingest"), 0L);
++        final Settings settings = Settings.builder()
++            .put(nodeSettings("withdrawal-observer"))
++            .put(NodeSettings.WRITER_HANDOFF_READER.getKey(), "receipt-reader")
++            .put("http.type", org.opensearch.transport.Netty4ModulePlugin.NETTY_SECURE_HTTP_TRANSPORT_NAME)
++            .build();
++        try (
++            ServerlessNode observer = new ServerlessNode(settings, List.of(authPlugin(settings), new ServerlessTlsTests.TlsPlugin()));
++            HttpClient client = HttpClient.newBuilder().sslContext(ServerlessTlsTests.TlsPlugin.httpClientContext()).build()
++        ) {
++            observer.startup().start();
++            observer.setMetadataPlane(plane);
++            ready(observer, plane, clock);
++            final String base = "https://127.0.0.1:" + observer.boundHttpAddress().publishAddress().getPort();
++            final String admin = basic(ADMIN, ADMIN_PASSWORD);
++            final Response created = sendAt(
++                client,
++                "PUT",
++                base + "/_serverless/security/users/receipt-reader",
++                admin,
++                "{\"password\":\"reader-password\"}"
++            );
++            assertEquals(created.body(), 200, created.status());
++            final var local = observer.localNode();
++            final String prefix = base + "/_serverless/writer_withdrawal_view/" + local.getId() + "/";
++            final String view = prefix + local.getEphemeralId() + "/writer/";
++            final String path = view + "writer-process";
++            final String reader = basic("receipt-reader", "reader-password");
++            assertEquals(401, sendAt(client, "GET", path, null, null).status());
++            assertEquals(403, sendAt(client, "GET", path, admin, null).status());
++            assertEquals(409, sendAt(client, "GET", prefix + "old-observer/writer/writer-process", reader, null).status());
++
++            writer.membership().renew(writerLease);
++            plane.membership().refresh();
++            final var withdrawing = new NodeLease(
++                "writer",
++                "writer-process",
++                writerLease.address(),
++                Set.of("ingest", NodeLease.WRITER_TRAFFIC_WITHDRAWN),
++                0L
++            );
++            writer.membership().renew(withdrawing);
++            assertTrue(plane.membership().read("writer").orElseThrow().writerTrafficWithdrawn());
++            final Response pending = sendAt(client, "GET", path, reader, null);
++            assertEquals(pending.body(), 200, pending.status());
++            assertTrue(pending.body(), pending.body().contains("\"withdrawn\":false"));
++
++            clock.addAndGet(TTL);
++            writer.membership().renew(withdrawing);
++            observer.leases().renewLease(plane);
++            plane.membership().refresh();
++            final Response observed = sendAt(client, "GET", path, reader, null);
++            assertEquals(observed.body(), 200, observed.status());
++            assertEquals("no-store", observed.header("Cache-Control"));
++            assertTrue(observed.body(), observed.body().contains("\"withdrawn\":true"));
++            final Response staleWriter = sendAt(client, "GET", view + "old-writer", reader, null);
++            assertEquals(staleWriter.body(), 200, staleWriter.status());
++            assertTrue(staleWriter.body(), staleWriter.body().contains("\"withdrawn\":false"));
+         }
+     }
+ 

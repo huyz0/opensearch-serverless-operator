@@ -1,0 +1,74 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+@@ -178,7 +178,19 @@
+      * @throws IOException if the register cannot be read or parsed
+      */
+     public Optional<ShardHead> read(String indexName, int shardId) throws IOException {
++        return read(ref(indexName, shardId));
++    }
++
++    /**
++     * Reads the physical head only for an independent shard. A bucket head's WAL debt covers every member and
++     * cannot qualify settlement for an individual shard.
++     */
++    public Optional<ShardHead> readIndependent(String indexName, int shardId) throws IOException {
+         final HeadRef ref = ref(indexName, shardId);
++        return ref.bucketed() ? Optional.empty() : read(ref);
++    }
++
++    private Optional<ShardHead> read(HeadRef ref) throws IOException {
+         final Optional<BlobRegister> register = container.readRegister(ref.name());
+         if (register.isEmpty()) {
+             return Optional.empty();
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterSuccessorHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterSuccessorHandler.java
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterSuccessorHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/WriterSuccessorHandler.java
+@@ -121,7 +121,7 @@
+             pending(channel);
+             return;
+         }
+-        final var head = metadata.heads().read(shardId.getIndexName(), shardId.id());
++        final var head = metadata.heads().readIndependent(shardId.getIndexName(), shardId.id());
+         if (head.isEmpty()
+             || head.get().term() != term
+             || nodeId.equals(head.get().ownerNodeId()) == false
+@@ -140,6 +140,8 @@
+             content.field("index_uuid", shardId.getIndex().getUUID());
+             content.field("shard", shardId.id());
+             content.field("term", term);
++            // The durable head keeps predecessor logs until replay and publication settle.
++            content.field("predecessor_wal_settled", head.get().writers().isEmpty());
+             content.endObject();
+             send(channel, new BytesRestResponse(RestStatus.OK, content));
+         }
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessAuthTests.java
+@@ -280,6 +280,11 @@
+             final Response observation = sendAt(client, "GET", path + "1", reader, null);
+             assertEquals(observation.body(), 200, observation.status());
+             assertTrue(observation.body(), observation.body().contains("\"term\":2"));
++            assertBusy(() -> {
++                final Response settled = sendAt(client, "GET", path + "1", reader, null);
++                assertEquals(settled.body(), 200, settled.status());
++                assertTrue(settled.body(), settled.body().contains("\"predecessor_wal_settled\":true"));
++            });
+             assertEquals(404, sendAt(client, "GET", path + "2", reader, null).status());
+             assertEquals(404, sendAt(client, "GET", path.replace(uuid, "another-uuid") + "1", reader, null).status());
+         }
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/DiscardingTranslogTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/DiscardingTranslogTests.java
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/DiscardingTranslogTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/DiscardingTranslogTests.java
+@@ -117,6 +117,11 @@
+                 for (int i = 0; i < 20; i++) {
+                     assertEquals("doc-" + i + " in " + shardId, i != 4, second.reads().get(shardId, "doc-" + i).found());
+                 }
++                assertBusy(() -> {
++                    final var head = plane.heads().readIndependent(shardId.getIndexName(), shardId.id()).orElseThrow();
++                    assertEquals(second.localNode().getId(), head.ownerNodeId());
++                    assertTrue("the replayed predecessor must be settled durably", head.writers().isEmpty());
++                });
+             }
+         }
+     }

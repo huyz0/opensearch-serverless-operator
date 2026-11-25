@@ -1,0 +1,639 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.3
+  name: opensearchserverlessoperations.serverless.opensearch.org
+spec:
+  group: serverless.opensearch.org
+  names:
+    kind: OpenSearchServerlessOperation
+    listKind: OpenSearchServerlessOperationList
+    plural: opensearchserverlessoperations
+    singular: opensearchserverlessoperation
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: OpenSearchServerlessOperation requests an explicit action.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              OperationSpec records immutable intent. The controller verifies the
+              referenced instance, the operation claim and action-specific prerequisites
+              before issuing effects. New action checks run at creation so operations
+              stored by older releases can still update status and clear finalizers.
+            properties:
+              action:
+                enum:
+                - Promote
+                - Rollback
+                - Decommission
+                - ApplyClusterSettings
+                - ApplySecurityConfiguration
+                - RetryProvisioning
+                - RetireWriter
+                type: string
+              clusterSettings:
+                description: ClusterSettingsPatch represents an explicit persistent
+                  settings change.
+                properties:
+                  remove:
+                    items:
+                      type: string
+                    type: array
+                  set:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: cluster settings patch must not be empty
+                  optionalOldSelf: true
+                  rule: oldSelf.hasValue() || ((has(self.set) && size(self.set) >
+                    0) || (has(self.remove) && size(self.remove) > 0))
+              expectedServingFleetByRole:
+                additionalProperties:
+                  type: string
+                type: object
+              instanceRef:
+                description: InstanceReference identifies the instance targeted by
+                  an operation.
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                  uid:
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
+              provisioningRetry:
+                description: ProvisioningRetry authorizes one new attempt after resolving
+                  a blocked Pod.
+                properties:
+                  acknowledgeNewAttempt:
+                    type: boolean
+                    x-kubernetes-validations:
+                    - message: a new provisioning attempt must be acknowledged
+                      rule: self == true
+                  podUID:
+                    minLength: 1
+                    type: string
+                required:
+                - acknowledgeNewAttempt
+                - podUID
+                type: object
+              routingMode:
+                enum:
+                - WeightedGateway
+                type: string
+              securityConfiguration:
+                description: SecurityConfigurationChange selects a staged revision
+                  and expected current revision.
+                properties:
+                  account:
+                    description: |-
+                      SecurityAccountChange carries one account transition. An absent previous
+                      reference creates the account. An absent desired reference removes it.
+                    properties:
+                      desiredPasswordRef:
+                        description: SecretKeyReference identifies a key in a same-namespace
+                          Secret.
+                        properties:
+                          key:
+                            minLength: 1
+                            type: string
+                          name:
+                            minLength: 1
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      previousPasswordRef:
+                        description: SecretKeyReference identifies a key in a same-namespace
+                          Secret.
+                        properties:
+                          key:
+                            minLength: 1
+                            type: string
+                          name:
+                            minLength: 1
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      username:
+                        pattern: ^[A-Za-z0-9_.@-]{1,64}$
+                        type: string
+                    required:
+                    - username
+                    type: object
+                    x-kubernetes-validations:
+                    - message: an account change needs at least one password reference
+                      rule: has(self.previousPasswordRef) || has(self.desiredPasswordRef)
+                  candidateRevision:
+                    minLength: 1
+                    type: string
+                  expectedActiveRevision:
+                    minLength: 1
+                    type: string
+                required:
+                - candidateRevision
+                - expectedActiveRevision
+                type: object
+              supersedesOperationUID:
+                type: string
+              targetFleet:
+                type: string
+              weightedTraffic:
+                description: |-
+                  WeightedPromotionTraffic sets candidate percentages between admission at
+                  1% and full cutover at 100%. Each role advances in the supplied order.
+                properties:
+                  ingest:
+                    items:
+                      maximum: 99
+                      minimum: 2
+                      type: integer
+                    maxItems: 30
+                    type: array
+                  search:
+                    items:
+                      maximum: 99
+                      minimum: 2
+                      type: integer
+                    maxItems: 30
+                    type: array
+                type: object
+              writerRetirement:
+                description: WriterRetirementTarget selects one serving index Pod
+                  by Kubernetes identity.
+                properties:
+                  podName:
+                    minLength: 1
+                    type: string
+                  podUID:
+                    minLength: 1
+                    type: string
+                required:
+                - podName
+                - podUID
+                type: object
+            required:
+            - action
+            - instanceRef
+            type: object
+            x-kubernetes-validations:
+            - message: operation spec is immutable
+              rule: self == oldSelf
+            - message: weighted traffic requires a WeightedGateway promotion
+              rule: '!has(self.weightedTraffic) || (self.action == ''Promote'' &&
+                has(self.routingMode) && self.routingMode == ''WeightedGateway'')'
+            - message: RetireWriter requires a writer retirement payload
+              rule: has(self.writerRetirement) == (self.action == 'RetireWriter')
+            - message: clusterSettings is required only for ApplyClusterSettings
+              optionalOldSelf: true
+              rule: oldSelf.hasValue() || (has(self.clusterSettings) == (self.action
+                == 'ApplyClusterSettings'))
+            - message: securityConfiguration is required only for ApplySecurityConfiguration
+              optionalOldSelf: true
+              rule: oldSelf.hasValue() || (has(self.securityConfiguration) == (self.action
+                == 'ApplySecurityConfiguration'))
+            - message: provisioningRetry is required only for RetryProvisioning
+              optionalOldSelf: true
+              rule: oldSelf.hasValue() || (has(self.provisioningRetry) == (self.action
+                == 'RetryProvisioning'))
+            - message: routingMode requires a promotion or rollback
+              optionalOldSelf: true
+              rule: oldSelf.hasValue() || (!has(self.routingMode) || self.action in
+                ['Promote', 'Rollback'])
+            - message: only rollback can supersede an operation
+              optionalOldSelf: true
+              rule: oldSelf.hasValue() || (!has(self.supersedesOperationUID) || size(self.supersedesOperationUID)
+                == 0 || self.action == 'Rollback')
+            - message: only promotion and rollback require a target fleet and both
+                expected role assignments
+              optionalOldSelf: true
+              rule: 'oldSelf.hasValue() || (self.action in [''Promote'', ''Rollback'']
+                ? has(self.targetFleet) && size(self.targetFleet) > 0 && has(self.expectedServingFleetByRole)
+                && size(self.expectedServingFleetByRole) == 2 && ''search'' in self.expectedServingFleetByRole
+                && size(self.expectedServingFleetByRole[''search'']) > 0 && ''ingest''
+                in self.expectedServingFleetByRole && size(self.expectedServingFleetByRole[''ingest''])
+                > 0 : (!has(self.targetFleet) || size(self.targetFleet) == 0) && (!has(self.expectedServingFleetByRole)
+                || size(self.expectedServingFleetByRole) == 0))'
+          status:
+            description: OperationStatus records observed progress independently of
+              operation intent.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+              rolloutRoles:
+                additionalProperties:
+                  description: RolloutRoleStatus pins one Service transition before
+                    any selector change.
+                  properties:
+                    adoptExisting:
+                      type: boolean
+                    appliedAt:
+                      format: date-time
+                      type: string
+                    candidateRevision:
+                      type: string
+                    converged:
+                      type: boolean
+                    phase:
+                      type: string
+                    serviceUID:
+                      type: string
+                    sourceFleet:
+                      type: string
+                    sourceRevision:
+                      type: string
+                    targetFleet:
+                      type: string
+                  required:
+                  - candidateRevision
+                  - phase
+                  - serviceUID
+                  - sourceFleet
+                  - targetFleet
+                  type: object
+                type: object
+              securityAccountSources:
+                description: SecurityAccountSources pins the immutable inputs for
+                  a single dispatch.
+                properties:
+                  consumers:
+                    additionalProperties:
+                      type: string
+                    maxProperties: 512
+                    type: object
+                  desiredSecretUID:
+                    type: string
+                  previousSecretUID:
+                    type: string
+                type: object
+              settingsBase:
+                additionalProperties:
+                  description: |-
+                    SettingValue records presence separately from the value, so absence is not
+                    confused with an explicitly configured empty string.
+                  properties:
+                    present:
+                      type: boolean
+                    value:
+                      type: string
+                  required:
+                  - present
+                  type: object
+                type: object
+              settingsServiceUID:
+                type: string
+              weightedRollout:
+                description: WeightedRolloutStatus records ordered, per-role route
+                  steps for one claim.
+                properties:
+                  admissionWeight:
+                    type: integer
+                  instanceGeneration:
+                    format: int64
+                    type: integer
+                  roles:
+                    additionalProperties:
+                      properties:
+                        appliedAt:
+                          format: date-time
+                          type: string
+                        backendUIDs:
+                          additionalProperties:
+                            type: string
+                          type: object
+                        initialWeights:
+                          additionalProperties:
+                            type: integer
+                          type: object
+                        lastAppliedAt:
+                          format: date-time
+                          type: string
+                        nextStep:
+                          type: integer
+                        revisions:
+                          additionalProperties:
+                            type: string
+                          type: object
+                        routeName:
+                          type: string
+                        routeSpecDigest:
+                          type: string
+                        routeUID:
+                          type: string
+                        stableServiceUID:
+                          type: string
+                        targets:
+                          items:
+                            properties:
+                              weights:
+                                additionalProperties:
+                                  type: integer
+                                type: object
+                            required:
+                            - weights
+                            type: object
+                          maxItems: 32
+                          type: array
+                      required:
+                      - backendUIDs
+                      - initialWeights
+                      - nextStep
+                      - revisions
+                      - routeName
+                      - routeSpecDigest
+                      - routeUID
+                      type: object
+                    maxProperties: 2
+                    type: object
+                required:
+                - admissionWeight
+                - instanceGeneration
+                - roles
+                type: object
+              writerRetirement:
+                description: |-
+                  WriterRetirementStatus pins the runtime and routing identities before withdrawal.
+                  It remains reserved through admission closure and successor verification.
+                properties:
+                  admissionClosed:
+                    type: boolean
+                  bindingDigest:
+                    type: string
+                  containerID:
+                    type: string
+                  evictionArmed:
+                    type: boolean
+                  gatewayServiceUID:
+                    type: string
+                  gatewayUID:
+                    type: string
+                  headInventory:
+                    description: WriterHeadInventoryStatus records the heads found
+                      while the victim was fenced.
+                    properties:
+                      heads:
+                        items:
+                          description: RetiringWriterHead identifies one physical
+                            register and its observed owner term.
+                          properties:
+                            bucketID:
+                              type: string
+                            index:
+                              type: string
+                            indexUUID:
+                              type: string
+                            key:
+                              type: string
+                            shard:
+                              format: int32
+                              type: integer
+                            term:
+                              format: int64
+                              type: integer
+                          required:
+                          - index
+                          - key
+                          - shard
+                          - term
+                          type: object
+                        maxItems: 512
+                        type: array
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observerEphemeralID:
+                        type: string
+                      observerNodeID:
+                        type: string
+                      observerPodUID:
+                        type: string
+                    required:
+                    - heads
+                    - observedAt
+                    - observerEphemeralID
+                    - observerNodeID
+                    - observerPodUID
+                    type: object
+                  instanceGeneration:
+                    format: int64
+                    type: integer
+                  inventoryObserverOffset:
+                    description: InventoryObserverOffset advances past an unavailable
+                      durable head observer.
+                    maximum: 511
+                    minimum: 0
+                    type: integer
+                  nodeEphemeralID:
+                    type: string
+                  nodeID:
+                    type: string
+                  preparerSecretUID:
+                    type: string
+                  receiptMissingAt:
+                    format: date-time
+                    type: string
+                  receiptObserverOffset:
+                    description: ReceiptObserverOffset advances past unavailable receipt
+                      observers.
+                    maximum: 511
+                    minimum: 0
+                    type: integer
+                  releaseReceipt:
+                    description: WriterReleaseReceiptStatus maps the retired JVM's
+                      receipt to the immutable head inventory.
+                    properties:
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observerEphemeralID:
+                        type: string
+                      observerNodeID:
+                        type: string
+                      observerPodUID:
+                        type: string
+                      releases:
+                        items:
+                          properties:
+                            inventoryIndex:
+                              description: InventoryIndex identifies an entry in headInventory.heads.
+                              format: int32
+                              type: integer
+                            localCleanupComplete:
+                              type: boolean
+                            outcome:
+                              type: string
+                          required:
+                          - inventoryIndex
+                          - localCleanupComplete
+                          - outcome
+                          type: object
+                        maxItems: 512
+                        type: array
+                    required:
+                    - observedAt
+                    - observerEphemeralID
+                    - observerNodeID
+                    - observerPodUID
+                    - releases
+                    type: object
+                  routeUID:
+                    type: string
+                  serviceUID:
+                    type: string
+                  servingFleet:
+                    type: string
+                  successorScanOffset:
+                    type: integer
+                  successors:
+                    items:
+                      description: WriterSuccessorStatus records a foreground write
+                        against a journaled head.
+                      properties:
+                        ephemeralID:
+                          type: string
+                        inventoryIndex:
+                          format: int32
+                          type: integer
+                        nodeID:
+                          type: string
+                        observedAt:
+                          format: date-time
+                          type: string
+                        podUID:
+                          type: string
+                        predecessorWALSettled:
+                          type: boolean
+                        term:
+                          format: int64
+                          type: integer
+                      required:
+                      - ephemeralID
+                      - inventoryIndex
+                      - nodeID
+                      - observedAt
+                      - podUID
+                      - term
+                      type: object
+                    maxItems: 512
+                    type: array
+                  victimGone:
+                    type: boolean
+                  withdrawalArmed:
+                    type: boolean
+                  withdrawalDeadline:
+                    format: date-time
+                    type: string
+                  withdrawnAt:
+                    format: date-time
+                    type: string
+                required:
+                - bindingDigest
+                - containerID
+                - gatewayServiceUID
+                - gatewayUID
+                - instanceGeneration
+                - nodeEphemeralID
+                - nodeID
+                - preparerSecretUID
+                - routeUID
+                - serviceUID
+                - servingFleet
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

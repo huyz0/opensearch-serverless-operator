@@ -1,0 +1,58 @@
+# Replace the example namespaces, ServiceAccount and route names.
+# Apply the ordinary endpoint-observation role in the instance namespace too.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: writer-retirement-route-reader
+  namespace: operator-development
+rules:
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
+    resourceNames: [catalog-index]
+    verbs: [get]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [gateways]
+    resourceNames: [catalog-gateway]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: writer-retirement-route-reader
+  namespace: operator-development
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: writer-retirement-route-reader
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-serverless-operator
+    namespace: operator-development
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: writer-retirement-frontend-reader
+  namespace: envoy-gateway-system
+rules:
+  - apiGroups: ['']
+    resources: [services]
+    resourceNames: [catalog-envoy]
+    verbs: [get]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: writer-retirement-frontend-reader
+  namespace: envoy-gateway-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: writer-retirement-frontend-reader
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-serverless-operator
+    namespace: operator-development

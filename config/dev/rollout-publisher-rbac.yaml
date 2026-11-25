@@ -1,0 +1,44 @@
+# Apply in the instance namespace for the separate platform publisher.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opensearch-rollout-publisher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensearch-rollout-publisher
+rules:
+  - apiGroups: [serverless.opensearch.org]
+    resources: [opensearchserverlesses, opensearchserverlessoperations]
+    verbs: [get]
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: ['']
+    resources: [configmaps]
+    verbs: [get, create, update]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opensearch-rollout-publisher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opensearch-rollout-publisher
+subjects:
+  - kind: ServiceAccount
+    name: opensearch-rollout-publisher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: opensearch-rollout-publisher-node-reader
+rules:
+  - apiGroups: ['']
+    resources: [nodes]
+    verbs: [get]

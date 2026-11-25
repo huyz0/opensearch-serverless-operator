@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runtime
+  namespace: operator-development
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: external-repository
+  namespace: operator-development
+data:
+  bucket: replace-with-existing-bucket
+  region: us-east-1
+---
+apiVersion: serverless.opensearch.org/v1alpha1
+kind: OpenSearchServerless
+metadata:
+  name: catalog
+  namespace: operator-development
+spec:
+  image: example.invalid/opensearch-java@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  serviceAccountName: runtime
+  storage:
+    type: s3
+    repositoryRef:
+      name: external-repository
+    credentials:
+      type: Keystore
+      keystoreSecretRef:
+        name: runtime-s3
+  tls:
+    http:
+      source: Secret
+      certificateRef:
+        name: http-leaf
+      trustBundleRef:
+        name: http-roots
+        key: ca.crt
+  security:
+    provider: ServerlessBasicAuth
+    authenticationSecretRef:
+      name: runtime-s3
+      key: bootstrap-password
+  pools:
+    search:
+      jvmHeap: 256Mi
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+          ephemeral-storage: 128Mi
+      zones:
+        zone-a:
+          replicas: 1
+          minServing: 1
+    ingest:
+      jvmHeap: 256Mi
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+          ephemeral-storage: 128Mi
+      zones:
+        zone-a:
+          replicas: 1
+          minServing: 1

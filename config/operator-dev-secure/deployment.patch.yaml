@@ -1,0 +1,34 @@
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: JAVA_RUNTIME_IMAGE
+    valueFrom:
+      configMapKeyRef:
+        name: opensearch-secure-runtime
+        key: javaImage
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: CLUSTER_DNS_DOMAIN
+    valueFrom:
+      configMapKeyRef:
+        name: opensearch-secure-runtime
+        key: clusterDomain
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --development-cluster-domain=$(CLUSTER_DNS_DOMAIN)
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --development-peer-dns-image=$(JAVA_RUNTIME_IMAGE)
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --development-http-tls-image=$(JAVA_RUNTIME_IMAGE)
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --development-basic-auth-image=$(JAVA_RUNTIME_IMAGE)
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --development-observe-endpoints
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --development-service-probe-image=$(JAVA_RUNTIME_IMAGE)

@@ -1,0 +1,513 @@
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchReadiness.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchReadiness.java
+index 5808ca2..a4c2998 100644
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchReadiness.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchReadiness.java
+@@ -11,6 +11,7 @@ package org.opensearch.serverless.node;
+ import java.util.LinkedHashSet;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.UUID;
+ import java.util.WeakHashMap;
+ 
+ /**
+@@ -48,11 +49,53 @@ public final class SearchReadiness {
+     private static final Map<NodeContext, SearchReadiness> BY_NODE = new WeakHashMap<>();
+ 
+     private final boolean servesSearches;
++
++    private final boolean requireWarmupCompletion;
+     private volatile State state;
++    private final String processIncarnation = UUID.randomUUID().toString();
++    private WarmupResult warmupResult;
++    private boolean warmupTimedOut;
++
++    /** Completion of the background work, independent of traffic readiness. */
++    public enum WarmupResult {
++        NOT_REQUESTED,
++        RUNNING,
++        COMPLETED,
++        DEGRADED,
++        FAILED
++    }
++
++    /** One atomic process-local observation; completed does not guarantee future cache residency. */
++    public record WarmupSnapshot(String incarnation, WarmupResult result, boolean timedOut) {
++    }
+ 
+-    SearchReadiness(boolean servesSearches, boolean warmOnJoin) {
++    SearchReadiness(boolean servesSearches, boolean warmOnJoin, boolean requireWarmupCompletion) {
++        if (servesSearches && requireWarmupCompletion && warmOnJoin == false) {
++            throw new IllegalArgumentException("search warm-up completion requires warm-on-join");
++        }
+         this.servesSearches = servesSearches;
++        this.requireWarmupCompletion = requireWarmupCompletion;
+         this.state = servesSearches && warmOnJoin ? State.WARMING : State.READY;
++        this.warmupResult = servesSearches && warmOnJoin ? WarmupResult.RUNNING : WarmupResult.NOT_REQUESTED;
++    }
++
++    /** Returns background warm-up progress for this process incarnation. */
++    public synchronized WarmupSnapshot warmupSnapshot() {
++        return new WarmupSnapshot(processIncarnation, warmupResult, warmupTimedOut);
++    }
++
++    /** Records that the readiness deadline elapsed without ending background work. */
++    public synchronized void markWarmupTimedOut() {
++        if (warmupResult == WarmupResult.RUNNING) {
++            warmupTimedOut = true;
++        }
++    }
++
++    /** Records the end of background warm-up without changing serving readiness. */
++    public synchronized void finishWarmup(boolean success, boolean degraded) {
++        if (warmupResult == WarmupResult.RUNNING) {
++            warmupResult = success == false ? WarmupResult.FAILED : degraded ? WarmupResult.DEGRADED : WarmupResult.COMPLETED;
++        }
+     }
+ 
+     /**
+@@ -65,7 +108,11 @@ public final class SearchReadiness {
+         synchronized (BY_NODE) {
+             return BY_NODE.computeIfAbsent(
+                 node,
+-                n -> new SearchReadiness(n.roles().contains(NodeContext.ROLE_SEARCH), SearchSettings.WARM_ON_JOIN.get(n.settings()))
++                n -> new SearchReadiness(
++                    n.roles().contains(NodeContext.ROLE_SEARCH),
++                    SearchSettings.WARM_ON_JOIN.get(n.settings()),
++                    SearchSettings.REQUIRE_WARMUP_COMPLETION.get(n.settings())
++                )
+             );
+         }
+     }
+@@ -84,8 +131,11 @@ public final class SearchReadiness {
+      *
+      * @return true once ready and until it drains
+      */
+-    public boolean ready() {
+-        return state == State.READY;
++    public synchronized boolean ready() {
++        return state == State.READY
++            && (requireWarmupCompletion == false
++                || servesSearches == false
++                || warmupResult == WarmupResult.COMPLETED && warmupTimedOut == false);
+     }
+ 
+     /**
+@@ -97,6 +147,11 @@ public final class SearchReadiness {
+         return servesSearches;
+     }
+ 
++    /** Whether this search process requires completed warm-up to serve. */
++    public boolean requiresWarmupCompletion() {
++        return servesSearches && requireWarmupCompletion;
++    }
++
+     /** Marks a warming node ready; its next lease renewal advertises the search role. A draining node stays draining. */
+     public void markReady() {
+         synchronized (this) {
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchSettings.java b/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchSettings.java
+index 7ffd32c..072e93e 100644
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchSettings.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/SearchSettings.java
+@@ -67,6 +67,13 @@ public final class SearchSettings implements SettingsProvider {
+     /** Whether a search node joins unready and turns ready only once it has warmed. */
+     public static final Setting<Boolean> WARM_ON_JOIN = Setting.boolSetting("serverless.search.warm_on_join", false, Property.NodeScope);
+ 
++    /** Require a completed, non-timeout warm-up before serving or advertising the search role. */
++    public static final Setting<Boolean> REQUIRE_WARMUP_COMPLETION = Setting.boolSetting(
++        "serverless.search.require_warmup_completion",
++        false,
++        Property.NodeScope
++    );
++
+     /** The longest a joining node stays warming before it turns ready regardless. */
+     public static final Setting<TimeValue> WARM_ON_JOIN_MAX_WAIT = Setting.timeSetting(
+         "serverless.search.warm_on_join.max_wait",
+@@ -204,6 +211,7 @@ public final class SearchSettings implements SettingsProvider {
+             ROLLUP_MIN_INDICES,
+             MAX_ACTIVATIONS_PER_QUERY,
+             WARM_ON_JOIN,
++            REQUIRE_WARMUP_COMPLETION,
+             WARM_ON_JOIN_MAX_WAIT,
+             WARM_ON_JOIN_READY_FRACTION,
+             DRAIN_MAX_WAIT,
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/warm/SearchWarmup.java b/serverless/shell/src/main/java/org/opensearch/serverless/warm/SearchWarmup.java
+index 3ab1bfa..c8c1e34 100644
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/warm/SearchWarmup.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/warm/SearchWarmup.java
+@@ -57,6 +57,9 @@ public final class SearchWarmup {
+     public record Outcome(CacheWarmCopy.Outcome copy, int opened, int openFailed, int rangedReads, long tookMillis, long readyMillis) {
+     }
+ 
++    private record WarmAttempt(Outcome outcome, boolean storeReadFailed) {
++    }
++
+     private SearchWarmup() {}
+ 
+     /**
+@@ -76,31 +79,82 @@ public final class SearchWarmup {
+         node.threadPool().schedule(() -> {
+             if (done.compareAndSet(false, true)) {
+                 LOG.warn("search warm-up did not finish within [{}]; serving searches with the cache it has", maxWait);
++                readiness.markWarmupTimedOut();
+                 turnReady(node, plane);
+             }
+         }, maxWait, org.opensearch.threadpool.ThreadPool.Names.GENERIC);
+-        node.threadPool().generic().execute(() -> {
+-            try {
+-                final Outcome outcome = warm(node, plane, done);
+-                LOG.info(
+-                    new ServerlessLogMessage(
+-                        "Search warm-up finished",
+-                        Map.of(
+-                            "event", "search_warmup_finished",
+-                            "shards_opened", outcome.opened(),
+-                            "shards_failed", outcome.openFailed(),
+-                            "blocks_copied", outcome.copy().blocksCopied(),
+-                            "duration_ms", outcome.tookMillis()
+-                        )
++        final long started = System.nanoTime();
++        node.threadPool().generic().execute(() -> warmInBackground(node, plane, readiness, done, started, maxWait, false));
++    }
++
++    private static void warmInBackground(
++        NodeContext node,
++        MetadataPlane plane,
++        SearchReadiness readiness,
++        AtomicBoolean done,
++        long started,
++        TimeValue maxWait,
++        boolean retry
++    ) {
++        if (readiness.state() == SearchReadiness.State.DRAINING) {
++            readiness.finishWarmup(true, true);
++            return;
++        }
++        // A queued retry may run late under executor pressure. Do not start a
++        // new peer copy after the retry window has closed.
++        if (retry && java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) >= maxWait.millis()) {
++            readiness.finishWarmup(true, true);
++            return;
++        }
++        try {
++            final WarmAttempt attempt = warm(node, plane, done, false);
++            final Outcome outcome = attempt.outcome();
++            final long elapsedMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
++            if ((outcome.copy().peersFailed() > 0 || readiness.requiresWarmupCompletion() && outcome.copy().peersAsked() == 0)
++                && readiness.state() != SearchReadiness.State.DRAINING
++                && elapsedMillis < maxWait.millis() - 5_000L) {
++                node.threadPool()
++                    .schedule(
++                        () -> warmInBackground(node, plane, readiness, done, started, maxWait, true),
++                        TimeValue.timeValueSeconds(5),
++                        org.opensearch.threadpool.ThreadPool.Names.GENERIC
++                    );
++                return;
++            }
++            readiness.finishWarmup(
++                true,
++                outcome.copy().peersAsked() == 0
++                    || outcome.copy().peersFailed() > 0
++                    || outcome.openFailed() > 0
++                    || attempt.storeReadFailed()
++            );
++            if (readiness.ready()) {
++                turnReady(node, plane);
++            }
++            LOG.info(
++                new ServerlessLogMessage(
++                    "Search warm-up finished",
++                    Map.of(
++                        "event",
++                        "search_warmup_finished",
++                        "shards_opened",
++                        outcome.opened(),
++                        "shards_failed",
++                        outcome.openFailed(),
++                        "blocks_copied",
++                        outcome.copy().blocksCopied(),
++                        "duration_ms",
++                        outcome.tookMillis()
+                     )
+-                );
+-            } catch (Exception e) {
+-                LOG.warn("Search warm-up failed. Searches will use the available cache (error_type={})", e.getClass().getSimpleName());
+-                if (done.compareAndSet(false, true)) {
+-                    turnReady(node, plane);
+-                }
++                )
++            );
++        } catch (Exception e) {
++            readiness.finishWarmup(false, true);
++            LOG.warn("Search warm-up failed. Searches will use the available cache (error_type={})", e.getClass().getSimpleName());
++            if (done.compareAndSet(false, true)) {
++                turnReady(node, plane);
+             }
+-        });
++        }
+     }
+ 
+     /**
+@@ -112,10 +166,15 @@ public final class SearchWarmup {
+      * @throws java.io.IOException if the membership cannot be read
+      */
+     public static Outcome warm(NodeContext node, MetadataPlane plane) throws java.io.IOException {
+-        return warm(node, plane, new AtomicBoolean());
++        try {
++            return warm(node, plane, new AtomicBoolean(), true).outcome();
++        } catch (java.io.IOException | RuntimeException e) {
++            SearchReadiness.of(node).finishWarmup(false, true);
++            throw e;
++        }
+     }
+ 
+-    private static Outcome warm(NodeContext node, MetadataPlane plane, AtomicBoolean done) throws java.io.IOException {
++    private static WarmAttempt warm(NodeContext node, MetadataPlane plane, AtomicBoolean done, boolean finish) throws java.io.IOException {
+         final long started = System.nanoTime();
+         final double fraction = SearchSettings.WARM_ON_JOIN_READY_FRACTION.get(node.settings());
+         final Opening opening = new Opening(node, plane);
+@@ -132,7 +191,18 @@ public final class SearchWarmup {
+             turnReady(node, plane);
+             opening.readyAt = System.nanoTime();
+         }
+-        return opening.outcome(copy, ranged, started);
++        final Outcome outcome = opening.outcome(copy, ranged, started);
++        if (finish) {
++            SearchReadiness.of(node)
++                .finishWarmup(
++                    true,
++                    copy.peersAsked() == 0 || copy.peersFailed() > 0 || outcome.openFailed() > 0 || opening.storeReadFailed
++                );
++            if (SearchReadiness.of(node).ready()) {
++                turnReady(node, plane);
++            }
++        }
++        return new WarmAttempt(outcome, opening.storeReadFailed);
+     }
+ 
+     /**
+@@ -158,6 +228,7 @@ public final class SearchWarmup {
+         private final Map<CacheWarmCopy.Shard, ShardId> opened = new java.util.concurrent.ConcurrentHashMap<>();
+         private final Set<CacheWarmCopy.Shard> failed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+         private volatile long readyAt = -1;
++        private boolean storeReadFailed;
+ 
+         Opening(NodeContext node, MetadataPlane plane) {
+             this.node = node;
+@@ -190,6 +261,7 @@ public final class SearchWarmup {
+                 try {
+                     ranged += fetchFromStore(node, shard.getValue(), copy.unheld().getOrDefault(shard.getKey(), List.of()));
+                 } catch (Exception e) {
++                    storeReadFailed = true;
+                     LOG.debug("Could not finish warming a shard (error_type={})", e.getClass().getSimpleName());
+                 }
+             }
+diff --git a/serverless/shell/src/main/java/org/opensearch/serverless/rest/ServerlessReadyHandler.java b/serverless/shell/src/main/java/org/opensearch/serverless/rest/ServerlessReadyHandler.java
+index d98e9ba..79d43e5 100644
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/rest/ServerlessReadyHandler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/rest/ServerlessReadyHandler.java
+@@ -60,12 +60,16 @@ public final class ServerlessReadyHandler extends BaseRestHandler {
+         final boolean up = started.getAsBoolean();
+         final SearchReadiness search = readiness.get();
+         final boolean ready = up && search.ready();
++        final SearchReadiness.WarmupSnapshot warmup = search.warmupSnapshot();
+         return channel -> {
+             try (XContentBuilder builder = channel.newBuilder()) {
+                 builder.startObject();
+                 builder.field("ready", ready);
+                 builder.field("state", up ? search.state().name().toLowerCase(java.util.Locale.ROOT) : "starting");
+                 builder.field("serves_searches", search.servesSearches());
++                builder.field("process_incarnation", warmup.incarnation());
++                builder.field("warmup_result", warmup.result().name().toLowerCase(java.util.Locale.ROOT));
++                builder.field("warmup_timed_out", warmup.timedOut());
+                 builder.endObject();
+                 channel.sendResponse(new BytesRestResponse(ready ? RestStatus.OK : RestStatus.SERVICE_UNAVAILABLE, builder));
+             }
+diff --git a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/SearchWarmupTests.java b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/SearchWarmupTests.java
+index 7d4659e..11e9e39 100644
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/SearchWarmupTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/SearchWarmupTests.java
+@@ -11,10 +11,12 @@ package org.opensearch.serverless.testkit;
+ import org.opensearch.common.blobstore.BlobPath;
+ import org.opensearch.common.blobstore.fs.FsBlobStore;
+ import org.opensearch.common.settings.Settings;
++import org.opensearch.common.unit.TimeValue;
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.membership.NodeLease;
+ import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.node.NodeContext;
+ import org.opensearch.serverless.node.SearchReadiness;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.serverless.transport.CacheWarmCopy;
+@@ -23,6 +25,7 @@ import org.opensearch.test.OpenSearchTestCase;
+ 
+ import java.util.List;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ /**
+@@ -124,6 +127,12 @@ public class SearchWarmupTests extends OpenSearchTestCase {
+             final SearchWarmup.Outcome outcome = SearchWarmup.warm(joiner, plane);
+             logger.info("WARMUP|{}", outcome);
+             assertTrue(SearchReadiness.of(joiner).ready());
++            assertEquals(SearchReadiness.WarmupResult.COMPLETED, SearchReadiness.of(joiner).warmupSnapshot().result());
++            assertFalse(SearchReadiness.of(joiner).warmupSnapshot().timedOut());
++            assertNotEquals(
++                SearchReadiness.of(peer).warmupSnapshot().incarnation(),
++                SearchReadiness.of(joiner).warmupSnapshot().incarnation()
++            );
+             assertEquals(
+                 "ready and ranked at once, not at the next renewal",
+                 Set.of(ServerlessNode.ROLE_SEARCH),
+@@ -184,9 +193,150 @@ public class SearchWarmupTests extends OpenSearchTestCase {
+         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+         try (ServerlessNode lone = joined(new ServerlessNode(nodeSettings("lone", "search", true)), plane)) {
+             assertEquals(SearchReadiness.State.WARMING, SearchReadiness.of(lone).state());
++            assertEquals(SearchReadiness.WarmupResult.RUNNING, SearchReadiness.of(lone).warmupSnapshot().result());
+             SearchWarmup.startInBackground(lone, plane);
+             assertBusy(() -> assertTrue("with no peers it has nothing to copy and turns ready", SearchReadiness.of(lone).ready()));
++            assertBusy(() -> assertEquals(SearchReadiness.WarmupResult.DEGRADED, SearchReadiness.of(lone).warmupSnapshot().result()));
+             assertBusy(() -> assertEquals(Set.of(ServerlessNode.ROLE_SEARCH), advertised(plane, lone.localNode().getId())));
+         }
+     }
++
++    public void testReadinessTimeoutDoesNotClaimWarmupFinished() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
++        try (ServerlessNode node = joined(new ServerlessNode(nodeSettings("timeout-observation", "search", true)), plane)) {
++            final SearchReadiness readiness = SearchReadiness.of(node);
++            readiness.markWarmupTimedOut();
++            readiness.markReady();
++            assertTrue(readiness.ready());
++            assertTrue(readiness.warmupSnapshot().timedOut());
++            assertEquals(SearchReadiness.WarmupResult.RUNNING, readiness.warmupSnapshot().result());
++            readiness.finishWarmup(false, true);
++            assertEquals(SearchReadiness.WarmupResult.FAILED, readiness.warmupSnapshot().result());
++            assertTrue(readiness.warmupSnapshot().timedOut());
++        }
++    }
++
++    public void testStrictPeerReadinessRequiresSuccessfulWarmup() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
++        final Settings settings = Settings.builder()
++            .put(nodeSettings("strict-warm", "search", true))
++            .put("serverless.search.require_warmup_completion", true)
++            .build();
++        try (ServerlessNode node = joined(new ServerlessNode(settings), plane)) {
++            final SearchReadiness readiness = SearchReadiness.of(node);
++            readiness.markReady();
++            node.leases().renewLease(plane);
++            assertFalse(readiness.ready());
++            assertEquals(Set.of(), advertised(plane, node.localNode().getId()));
++            readiness.finishWarmup(true, false);
++            assertTrue(readiness.ready());
++            node.leases().renewLease(plane);
++            assertEquals(Set.of(ServerlessNode.ROLE_SEARCH), advertised(plane, node.localNode().getId()));
++            readiness.startDraining();
++            assertFalse(readiness.ready());
++        }
++    }
++
++    public void testStrictPeerReadinessRejectsDegradedOrTimedOutWarmup() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
++        final Settings settings = Settings.builder()
++            .put(nodeSettings("strict-degraded", "search", true))
++            .put("serverless.search.require_warmup_completion", true)
++            .put("serverless.search.warm_on_join.max_wait", "1s")
++            .build();
++        try (ServerlessNode node = joined(new ServerlessNode(settings), plane)) {
++            final SearchReadiness readiness = SearchReadiness.of(node);
++            SearchWarmup.startInBackground(node, plane);
++            assertBusy(() -> assertEquals(SearchReadiness.WarmupResult.DEGRADED, readiness.warmupSnapshot().result()));
++            assertFalse(readiness.ready());
++            assertEquals(Set.of(), advertised(plane, node.localNode().getId()));
++        }
++        final Settings timeoutSettings = Settings.builder()
++            .put(nodeSettings("strict-timeout", "search", true))
++            .put("serverless.search.require_warmup_completion", true)
++            .build();
++        try (ServerlessNode node = joined(new ServerlessNode(timeoutSettings), plane)) {
++            final SearchReadiness readiness = SearchReadiness.of(node);
++            readiness.markWarmupTimedOut();
++            readiness.markReady();
++            readiness.finishWarmup(true, false);
++            node.leases().renewLease(plane);
++            assertFalse(readiness.ready());
++            assertEquals(Set.of(), advertised(plane, node.localNode().getId()));
++        }
++    }
++
++    public void testStrictWarmupRetriesUntilSearchPeerAppears() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
++        final Settings strict = Settings.builder()
++            .put(nodeSettings("strict-wait-for-peer", "search", true))
++            .put("serverless.search.require_warmup_completion", true)
++            .put("serverless.search.warm_on_join.max_wait", "30s")
++            .build();
++        try (ServerlessNode node = joined(new ServerlessNode(strict), plane)) {
++            final SearchReadiness readiness = SearchReadiness.of(node);
++            SearchWarmup.startInBackground(node, plane);
++            assertBusy(() -> assertEquals(SearchReadiness.State.READY, readiness.state()));
++            assertFalse(readiness.ready());
++            assertEquals(SearchReadiness.WarmupResult.RUNNING, readiness.warmupSnapshot().result());
++            assertEquals(Set.of(), advertised(plane, node.localNode().getId()));
++            try (ServerlessNode peer = joined(new ServerlessNode(nodeSettings("late-search-peer", "search", false)), plane)) {
++                assertEquals(Set.of(ServerlessNode.ROLE_SEARCH), advertised(plane, peer.localNode().getId()));
++                assertBusy(
++                    () -> assertEquals(SearchReadiness.WarmupResult.COMPLETED, readiness.warmupSnapshot().result()),
++                    20,
++                    java.util.concurrent.TimeUnit.SECONDS
++                );
++                assertTrue(readiness.ready());
++                assertBusy(() -> assertEquals(Set.of(ServerlessNode.ROLE_SEARCH), advertised(plane, node.localNode().getId())));
++            }
++        }
++    }
++
++    private AtomicBoolean runQueuedRetry(ServerlessNode node, MetadataPlane plane, long started, TimeValue maxWait) throws Exception {
++        final var callback = SearchWarmup.class.getDeclaredMethod(
++            "warmInBackground",
++            NodeContext.class,
++            MetadataPlane.class,
++            SearchReadiness.class,
++            AtomicBoolean.class,
++            long.class,
++            TimeValue.class,
++            boolean.class
++        );
++        callback.setAccessible(true);
++        final AtomicBoolean readyTransition = new AtomicBoolean();
++        callback.invoke(null, node, plane, SearchReadiness.of(node), readyTransition, started, maxWait, true);
++        return readyTransition;
++    }
++
++    public void testLateQueuedRetryEndsDegradedWithoutStartingCopy() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
++        try (ServerlessNode node = joined(new ServerlessNode(nodeSettings("late-retry", "search", true)), plane)) {
++            final SearchReadiness readiness = SearchReadiness.of(node);
++            final long started = System.nanoTime() - java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
++            assertFalse(runQueuedRetry(node, plane, started, TimeValue.timeValueSeconds(1)).get());
++            assertEquals(SearchReadiness.State.WARMING, readiness.state());
++            assertEquals(SearchReadiness.WarmupResult.DEGRADED, readiness.warmupSnapshot().result());
++            assertEquals(Set.of(), advertised(plane, node.localNode().getId()));
++        }
++    }
++
++    public void testQueuedRetryDoesNotRestartWorkAfterDrain() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
++        try (ServerlessNode node = joined(new ServerlessNode(nodeSettings("draining-retry", "search", true)), plane)) {
++            final SearchReadiness readiness = SearchReadiness.of(node);
++            assertTrue(readiness.startDraining());
++            assertFalse(runQueuedRetry(node, plane, System.nanoTime(), TimeValue.timeValueMinutes(1)).get());
++            assertEquals(SearchReadiness.State.DRAINING, readiness.state());
++            assertEquals(SearchReadiness.WarmupResult.DEGRADED, readiness.warmupSnapshot().result());
++            assertEquals(Set.of(), advertised(plane, node.localNode().getId()));
++        }
++    }
+ }

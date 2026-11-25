@@ -1,0 +1,199 @@
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/node/WriterActivation.java
+@@ -10,8 +10,12 @@
+ import org.opensearch.cluster.ClusterState;
+ import org.opensearch.cluster.metadata.IndexMetadata;
+ import org.opensearch.cluster.node.DiscoveryNodes;
++import org.opensearch.common.annotation.InternalApi;
++import org.opensearch.common.lease.Releasable;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.cluster.ShardAssignment;
++
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ /**
+  * Activates writers for {@link NodeContext}: applies the metadata plane's truth, takes a shard's head and opens
+@@ -20,9 +24,39 @@
+ public final class WriterActivation {
+ 
+     private final NodeContext node;
++    private final ReentrantReadWriteLock writerAdmission = new ReentrantReadWriteLock();
++    private volatile boolean writerAdmissionClosed;
+ 
+     WriterActivation(NodeContext node) {
+         this.node = node;
++    }
++
++    /** Permanently closes writer admission and waits for admitted acquisitions and reopens to finish. */
++    @InternalApi
++    public void closeWriterAdmission() {
++        writerAdmissionClosed = true;
++        final var barrier = writerAdmission.writeLock();
++        barrier.lock();
++        barrier.unlock();
++    }
++
++    /** Whether the process has stopped accepting writer acquisitions and reopens. */
++    @InternalApi
++    public boolean isWriterAdmissionClosed() {
++        return writerAdmissionClosed;
++    }
++
++    private Releasable enterWriterAdmission() {
++        if (isWriterAdmissionClosed()) {
++            return null;
++        }
++        final var admission = writerAdmission.readLock();
++        admission.lock();
++        if (isWriterAdmissionClosed()) {
++            admission.unlock();
++            return null;
++        }
++        return admission::unlock;
+     }
+ 
+     /**
+@@ -87,6 +121,15 @@
+         java.util.Collection<IndexDescriptor> descriptors,
+         java.util.Collection<ShardAssignment> owned
+     ) throws Exception {
++        try (Releasable admission = enterWriterAdmission()) {
++            return admission != null ? applyAdmittedTruth(descriptors, owned) : java.util.Set.of();
++        }
++    }
++
++    private java.util.Set<org.opensearch.core.index.shard.ShardId> applyAdmittedTruth(
++        java.util.Collection<IndexDescriptor> descriptors,
++        java.util.Collection<ShardAssignment> owned
++    ) throws Exception {
+         node.ensureStarted();
+         // What this node hosts as a writer is exactly what it was handed; the view is that plus whatever
+         // it serves as a reader, so a dual-role node's readers are not projected away by a writer sync
+@@ -115,6 +158,13 @@
+      * @throws Exception if reading, projection or shard opening fails
+      */
+     public java.util.Set<org.opensearch.core.index.shard.ShardId> syncFrom(org.opensearch.serverless.metadata.MetadataPlane plane)
++        throws Exception {
++        try (Releasable admission = enterWriterAdmission()) {
++            return admission != null ? syncAdmittedFrom(plane) : java.util.Set.of();
++        }
++    }
++
++    private java.util.Set<org.opensearch.core.index.shard.ShardId> syncAdmittedFrom(org.opensearch.serverless.metadata.MetadataPlane plane)
+         throws Exception {
+         node.ensureStarted();
+         node.adopt(plane);
+@@ -173,7 +223,7 @@
+         final java.util.Collection<ShardAssignment> assignable = node.roles.contains(NodeContext.ROLE_INGEST)
+             ? assignments
+             : java.util.List.of();
+-        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(descriptors.values(), assignable);
++        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyAdmittedTruth(descriptors.values(), assignable);
+ 
+         // Closing here does NOT treat absence from a view as removal, but only because of what the close
+         // is keyed on -- and it used to be keyed on the wrong thing. Truth's assignment list is derived
+@@ -219,6 +269,16 @@
+      * @throws Exception if activation or opening fails
+      */
+     public java.util.Optional<org.opensearch.core.index.shard.ShardId> activateWriter(
++        org.opensearch.serverless.metadata.MetadataPlane plane,
++        String indexName,
++        int shardNumber
++    ) throws Exception {
++        try (Releasable admission = enterWriterAdmission()) {
++            return admission != null ? activateAdmittedWriter(plane, indexName, shardNumber) : java.util.Optional.empty();
++        }
++    }
++
++    private java.util.Optional<org.opensearch.core.index.shard.ShardId> activateAdmittedWriter(
+         org.opensearch.serverless.metadata.MetadataPlane plane,
+         String indexName,
+         int shardNumber
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
+@@ -413,6 +413,8 @@
+         // and settling queued activations lets a scheduler pass waiting on them finish as well.
+         loop.close();
+         scheduler.close();
++        // Split completion can open a writer outside the reconciliation scheduler.
++        node.activation().closeWriterAdmission();
+         try {
+             // Publish and release what this node owns, so its shards are claimable at a fresh term the
+             // moment a peer or this node's own restart wants them.
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ActivationResourceCleanupTests.java
+@@ -12,11 +12,16 @@
+ import org.opensearch.common.settings.Settings;
+ import org.opensearch.core.index.Index;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
++import org.opensearch.serverless.cluster.ShardAssignment;
+ import org.opensearch.serverless.metadata.MetadataPlane;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.serverless.store.SegmentPublisher;
+ import org.opensearch.test.OpenSearchTestCase;
+ 
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ public class ActivationResourceCleanupTests extends OpenSearchTestCase {
+@@ -98,4 +103,57 @@
+             }
+         }
+     }
++
++    public void testWriterAdmissionClosesBeforeWaitingForAnAdmittedOpen() throws Exception {
++        try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
++            final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
++            final var descriptor = new IndexDescriptor("docs", "uuid-docs", 2, MAPPING, null);
++            metadata.createIndex(descriptor);
++            try (var node = new ServerlessNode(settings("writer-admission")); var workers = Executors.newFixedThreadPool(2)) {
++                node.startup().start();
++                final var opening = new CountDownLatch(1);
++                final var finishOpen = new CountDownLatch(1);
++                store.onNextRegisterRead("segments", SegmentPublisher.MANIFEST, () -> {
++                    opening.countDown();
++                    try {
++                        assertTrue(finishOpen.await(30, TimeUnit.SECONDS));
++                    } catch (InterruptedException e) {
++                        Thread.currentThread().interrupt();
++                        throw new AssertionError(e);
++                    }
++                });
++                try {
++                    final var first = workers.submit(() -> node.activation().activateWriter(metadata, "docs", 0));
++                    assertTrue(opening.await(30, TimeUnit.SECONDS));
++                    final var closing = workers.submit(() -> node.activation().closeWriterAdmission());
++                    assertBusy(() -> assertTrue(node.activation().isWriterAdmissionClosed()));
++                    assertFalse("closing must wait for the already admitted writer", closing.isDone());
++                    assertTrue(node.activation().activateWriter(metadata, "docs", 1).isEmpty());
++                    assertTrue(metadata.heads().read("docs", 1).isEmpty());
++                    finishOpen.countDown();
++                    final var opened = first.get(30, TimeUnit.SECONDS).orElseThrow();
++                    closing.get(30, TimeUnit.SECONDS);
++                    assertNotNull("the admitted writer must be visible to handoff", node.reconciler().shard(opened));
++                    final var head = metadata.activate(
++                        "docs",
++                        1,
++                        node.localNode().getId(),
++                        node.localNode().getEphemeralId(),
++                        descriptor.uuid()
++                    );
++                    assertTrue(head.acquired());
++                    assertTrue(node.activation().syncFrom(metadata).isEmpty());
++                    assertTrue(
++                        node.activation()
++                            .applyTruth(List.of(descriptor), List.of(new ShardAssignment("docs", 1, head.head().term())))
++                            .isEmpty()
++                    );
++                    assertTrue(node.activation().activateWriter(metadata, "docs", 1).isEmpty());
++                    assertEquals(java.util.Set.of(opened), node.reconciler().openShards());
++                } finally {
++                    finishOpen.countDown();
++                }
++            }
++        }
++    }
+ }

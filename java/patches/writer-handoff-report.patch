@@ -1,0 +1,602 @@
+--- /dev/null
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/WriterHandoffReport.java
+@@ -0,0 +1,49 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ */
++package org.opensearch.serverless.reconcile;
++
++import org.opensearch.common.annotation.InternalApi;
++import org.opensearch.core.index.shard.ShardId;
++import org.opensearch.serverless.metadata.ShardHeadStore;
++
++import java.util.List;
++
++/** Local shutdown results for the writers the node attempted to hand off. */
++@InternalApi
++public record WriterHandoffReport(String nodeId, String ephemeralId, List<ShardResult> shards) {
++    public WriterHandoffReport {
++        shards = List.copyOf(shards);
++    }
++
++    /** The result as witnessed by the outgoing process. */
++    public enum Outcome {
++        /** The applied unowned head names no node WAL. */
++        RELEASED,
++        /** The applied unowned head names WAL that the successor must check. */
++        RELEASED_WITH_WAL,
++        /** Only this member was relinquished. A sibling kept the shared bucket head. */
++        MEMBER_RELEASED,
++        /** The process did not confirm this release. The durable head may have changed. */
++        UNCONFIRMED
++    }
++
++    /** The observed writer identity and result. Term is -1 if no local writer could be inspected. */
++    public record ShardResult(ShardId shard, long term, boolean hibernated, Outcome outcome, boolean localCleanupComplete) {
++    }
++
++    public long releasedCount() {
++        return shards.stream().filter(shard -> shard.outcome() == Outcome.RELEASED || shard.outcome() == Outcome.RELEASED_WITH_WAL).count();
++    }
++
++    static Outcome outcomeOf(ShardHeadStore.Release release) {
++        if (release.appliedHead() != null) {
++            return release.appliedHead().writers().isEmpty() ? Outcome.RELEASED : Outcome.RELEASED_WITH_WAL;
++        }
++        return release.accepted() ? Outcome.MEMBER_RELEASED : Outcome.UNCONFIRMED;
++    }
++}
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/BackgroundReconciler.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/BackgroundReconciler.java
+@@ -8,6 +8,7 @@
+ 
+ package org.opensearch.serverless.reconcile;
+ 
++import org.opensearch.common.annotation.InternalApi;
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.serverless.metadata.MetadataPlane;
+ import org.opensearch.serverless.node.NodeContext;
+@@ -933,7 +934,16 @@
+ 
+     /** Publishes and releases every writer shard this node holds, and gives back its hibernated writers' heads, for a clean shutdown. */
+     public int handOverAll() {
+-        return eviction.handOverAll() + hibernation.giveBackAll();
++        return Math.toIntExact(handOverWriters().shards().stream().filter(WriterHandoffReport.ShardResult::localCleanupComplete).count());
++    }
++
++    /** Hands off this process's observed writers after writer admission has closed. */
++    @InternalApi
++    public WriterHandoffReport handOverWriters() {
++        final var results = eviction.handOverOpenWriters();
++        results.addAll(hibernation.giveBackAll());
++        final var local = node.localNode();
++        return new WriterHandoffReport(local.getId(), local.getEphemeralId(), results);
+     }
+ 
+     /**
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardEviction.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardEviction.java
+@@ -8,10 +8,16 @@
+ package org.opensearch.serverless.reconcile;
+ 
+ import org.opensearch.core.index.shard.ShardId;
+-
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
++
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.Consumer;
+ 
+ /**
+  * Lets go of {@link BackgroundReconciler}'s shards: idle shards, shards evicted to make room under the cap, and
+@@ -274,7 +280,7 @@
+             // record behind a seal. The fence makes the release wait for writes in flight and makes writes
+             // that arrive during it wait for the close -- after which they find no shard and are refused,
+             // which is the truthful answer.
+-            return reconciler.node.fences().underShardFence(shardId, () -> letGoFenced(shardId, reason));
++            return reconciler.node.fences().underShardFence(shardId, () -> letGoFenced(shardId, reason, null));
+         } catch (Exception e) {
+             // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
+             // logged and retried on the next pass rather than propagated into the tick.
+@@ -288,7 +294,7 @@
+     }
+ 
+     /** The body of {@link #letGo} for a writer, run while the shard's fence is held. */
+-    boolean letGoFenced(ShardId shardId, String reason) throws Exception {
++    private boolean letGoFenced(ShardId shardId, String reason, Consumer<Outcome> onRelease) throws Exception {
+         final var shard = reconciler.node.reconciler().shard(shardId);
+         if (shard == null || reconciler.node.reconciler().isReader(shardId)) {
+             return false;
+@@ -343,8 +349,8 @@
+         // A head given back used to name this node's log whatever the publish had covered. Every reader opened on the shard
+         // afterwards then read this node's lease and probed its log, three reads and three round trips, to find nothing;
+         // the next owner did the same and then swapped the head once more to stop it naming the log.
+-        if (reconciler.plane.heads()
+-            .release(
++        final var release = reconciler.plane.heads()
++            .releaseWithEvidence(
+                 shardId.getIndexName(),
+                 shardId.id(),
+                 reconciler.node.localNode().getId(),
+@@ -352,7 +358,11 @@
+                 shardId.getIndex().getUUID(),
+                 reconciler.node.localNode().getEphemeralId(),
+                 publishedThrough ? null : reconciler.node.localNode().getId()
+-            ) == false) {
++            );
++        if (onRelease != null) {
++            onRelease.accept(WriterHandoffReport.outcomeOf(release));
++        }
++        if (release.accepted() == false) {
+             // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
+             // closing it while the head still points here is the one outcome to avoid.
+             BackgroundReconciler.logger.debug("Keeping a shard open after its head release failed (shard={})", shardId.id());
+@@ -412,18 +422,40 @@
+      * a restart a handover rather than a failover: the next owner acquires at a fresh term, and nothing
+      * this node acknowledged is behind a seal.
+      *
+-     * @return how many shards were handed over
+-     */
+-    public int handOverAll() {
+-        int handed = 0;
+-        for (ShardId shardId : new java.util.ArrayList<>(reconciler.node.reconciler().openShards())) {
++     * @return the result for every local open writer observed after admission closed
++     */
++    List<ShardResult> handOverOpenWriters() {
++        final List<ShardResult> results = new ArrayList<>();
++        for (ShardId shardId : new ArrayList<>(reconciler.node.reconciler().openShards())) {
+             if (reconciler.node.reconciler().isReader(shardId)) {
+                 continue;
+             }
+-            if (letGo(shardId, "shutting down")) {
+-                handed++;
+-            }
+-        }
+-        return handed;
++            try {
++                results.add(reconciler.node.fences().underShardFence(shardId, () -> {
++                    final var local = reconciler.node.reconciler().shard(shardId);
++                    final long term = local == null ? -1L : local.getOperationPrimaryTerm();
++                    final var outcome = new AtomicReference<>(Outcome.UNCONFIRMED);
++                    boolean cleanupComplete = false;
++                    try {
++                        cleanupComplete = letGoFenced(shardId, "shutting down", outcome::set);
++                    } catch (Exception e) {
++                        BackgroundReconciler.logger.warn(
++                            "Shutdown handoff or local cleanup failed (shard={}, error_type={})",
++                            shardId.id(),
++                            e.getClass().getSimpleName()
++                        );
++                    }
++                    return new ShardResult(shardId, term, false, outcome.get(), cleanupComplete);
++                }));
++            } catch (Exception e) {
++                BackgroundReconciler.logger.warn(
++                    "Could not confirm shutdown handoff (shard={}, error_type={})",
++                    shardId.id(),
++                    e.getClass().getSimpleName()
++                );
++                results.add(new ShardResult(shardId, -1L, false, Outcome.UNCONFIRMED, false));
++            }
++        }
++        return results;
+     }
+ }
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/reconcile/ShardHibernation.java
+@@ -9,10 +9,16 @@
+ 
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.serverless.node.WriterHibernation;
+-
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
++
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.Consumer;
+ 
+ /**
+  * Hibernates {@link BackgroundReconciler}'s idle writers: publishes what they hold, closes their engines and keeps
+@@ -210,23 +216,31 @@
+      * @return true if the head was given back here
+      */
+     boolean giveBack(WriterHibernation.Hibernated slept) {
++        return giveBack(slept, null);
++    }
++
++    private boolean giveBack(WriterHibernation.Hibernated slept, Consumer<Outcome> onRelease) {
+         final ShardId shardId = slept.shardId();
+         if (reconciler.node.hibernation().released(slept) == false) {
+             // Woken meanwhile.
+             return false;
+         }
+         try {
+-            final boolean given = reconciler.plane.heads()
+-                .release(
++            final var release = reconciler.plane.heads()
++                .releaseWithEvidence(
+                     shardId.getIndexName(),
+                     shardId.id(),
+                     reconciler.node.localNode().getId(),
+                     slept.term(),
+                     shardId.getIndex().getUUID(),
+-                    reconciler.node.localNode().getEphemeralId()
++                    reconciler.node.localNode().getEphemeralId(),
++                    reconciler.node.localNode().getId()
+                 );
++            if (onRelease != null) {
++                onRelease.accept(WriterHandoffReport.outcomeOf(release));
++            }
+             reconciler.plane.forgetAssignment(reconciler.node.localNode().getId(), shardId.getIndexName(), shardId.id());
+-            return given;
++            return release.accepted();
+         } catch (Exception e) {
+             // The head goes on naming this node with nothing open: the next request for it takes it the ordinary way, at
+             // a higher term, as a writer closed after a failed engine is.
+@@ -242,15 +256,15 @@
+     /**
+      * Gives back the head of every hibernated writer, for a clean shutdown.
+      *
+-     * @return how many were given back
+-     */
+-    int giveBackAll() {
+-        int given = 0;
++     * @return the outcome for each observed hibernated writer
++     */
++    List<ShardResult> giveBackAll() {
++        final List<ShardResult> results = new ArrayList<>();
+         for (WriterHibernation.Hibernated slept : reconciler.node.hibernation().all()) {
+-            if (giveBack(slept)) {
+-                given++;
+-            }
+-        }
+-        return given;
++            final var outcome = new AtomicReference<>(Outcome.UNCONFIRMED);
++            final boolean cleanupComplete = giveBack(slept, outcome::set);
++            results.add(new ShardResult(slept.shardId(), slept.term(), true, outcome.get(), cleanupComplete));
++        }
++        return results;
+     }
+ }
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/metadata/ShardHeadStore.java
+@@ -323,15 +323,15 @@
+     /**
+      * Gives back a bucket member: only the bucket's last member open here gives back the head.
+      */
+-    private boolean releaseMember(HeadRef ref, String nodeId, long expectedTerm, String expectedEphemeralId, String lastWriter)
++    private Release releaseMember(HeadRef ref, String nodeId, long expectedTerm, String expectedEphemeralId, String lastWriter)
+         throws IOException {
+         final org.opensearch.serverless.bucket.BucketHeads routing = buckets;
+         if (routing != null && routing.othersOpenOn(ref.member().bucketId(), nodeId, ref.indexName())) {
+-            return true;
++            return new Release(true, null);
+         }
+         final Optional<BlobRegister> existing = container.readRegister(ref.name());
+         if (existing.isEmpty()) {
+-            return false;
++            return new Release(false, null);
+         }
+         final ShardHead current = parse(existing.get());
+         if (nodeId.equals(current.ownerNodeId()) == false
+@@ -339,14 +339,16 @@
+             || (expectedEphemeralId != null
+                 && current.ownerEphemeralId() != null
+                 && expectedEphemeralId.equals(current.ownerEphemeralId()) == false)) {
+-            return false;
++            return new Release(false, null);
+         }
+         // A bucket head names the logs of every member: one member published through all it holds says nothing of the
+         // others, so the node giving it back is named even when the caller found its own member fully published.
+         final ShardHead released = ref.stored(current.term(), null, null, 0L, null)
+             .withWriters(current.writers())
+             .withWriter(lastWriter == null ? nodeId : lastWriter);
+-        return container.compareAndSwapRegister(ref.name(), existing.get().generation(), released.toBytes()).applied();
++        return container.compareAndSwapRegister(ref.name(), existing.get().generation(), released.toBytes()).applied()
++            ? new Release(true, released)
++            : new Release(false, null);
+     }
+ 
+     /**
+@@ -514,6 +516,25 @@
+         String expectedEphemeralId,
+         String lastWriter
+     ) throws IOException {
++        return releaseWithEvidence(indexName, shardId, nodeId, expectedTerm, expectedIndexUuid, expectedEphemeralId, lastWriter).accepted();
++    }
++
++    /** The head written by an accepted release, absent if a sibling still owns the shared bucket head. */
++    @org.opensearch.common.annotation.InternalApi
++    public record Release(boolean accepted, ShardHead appliedHead) {
++    }
++
++    /** Releases a writer and returns the exact contents written by its successful head CAS. */
++    @org.opensearch.common.annotation.InternalApi
++    public Release releaseWithEvidence(
++        String indexName,
++        int shardId,
++        String nodeId,
++        long expectedTerm,
++        String expectedIndexUuid,
++        String expectedEphemeralId,
++        String lastWriter
++    ) throws IOException {
+         final HeadRef ref = ref(indexName, shardId, expectedIndexUuid);
+         if (ref.bucketed()) {
+             return releaseMember(ref, nodeId, expectedTerm, expectedEphemeralId, lastWriter);
+@@ -521,7 +542,7 @@
+         // A swap lost to this owner's own change of the head -- the writers it stops naming once a replay is published,
+         // is tried again: every check is made again on what is read.
+         for (int attempt = 1;; attempt++) {
+-            final Boolean released = releaseOnce(
++            final Optional<ShardHead> released = releaseOnce(
+                 ref.name(),
+                 indexName,
+                 shardId,
+@@ -532,10 +553,10 @@
+                 lastWriter
+             );
+             if (released != null) {
+-                return released;
++                return new Release(released.isPresent(), released.orElse(null));
+             }
+             if (attempt >= RELEASE_ATTEMPTS) {
+-                return false;
++                return new Release(false, null);
+             }
+         }
+     }
+@@ -543,8 +564,8 @@
+     /** How many times a release whose swap was lost is tried. */
+     static final int RELEASE_ATTEMPTS = 3;
+ 
+-    /** One try of a release: whether it released, false if it may not, or null if its swap was lost. */
+-    private Boolean releaseOnce(
++    /** One try of a release: the applied head, empty on refusal, or null if its swap was lost. */
++    private Optional<ShardHead> releaseOnce(
+         String name,
+         String indexName,
+         int shardId,
+@@ -556,30 +577,32 @@
+     ) throws IOException {
+         final Optional<BlobRegister> existing = container.readRegister(name);
+         if (existing.isEmpty()) {
+-            return false;
++            return Optional.empty();
+         }
+         final ShardHead current;
+         try (InputStream in = existing.get().value().streamInput()) {
+             current = ShardHead.fromStream(in);
+         }
+         if (nodeId.equals(current.ownerNodeId()) == false) {
+-            return false;
++            return Optional.empty();
+         }
+         if (expectedTerm >= 0L && current.term() != expectedTerm) {
+-            return false;
++            return Optional.empty();
+         }
+         if ((expectedIndexUuid != null && current.indexUuid() != null && expectedIndexUuid.equals(current.indexUuid()) == false)
+             || (expectedEphemeralId != null
+                 && current.ownerEphemeralId() != null
+                 && expectedEphemeralId.equals(current.ownerEphemeralId()) == false)) {
+-            return false;
++            return Optional.empty();
+         }
+         // Unowned, but still this incarnation's: the uuid is kept so the next acquirer of a recreated
+         // index sees a head from the previous one and overwrites it, exactly as it would an owned one.
+         final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid()).withWriters(
+             current.writers()
+         ).withWriter(lastWriter);
+-        return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied() ? Boolean.TRUE : null;
++        return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied()
++            ? Optional.of(released)
++            : null;
+     }
+ 
+     /** A dead owner's head given back: the head as the owner left it, and the unowned one that replaced it. */
+--- a/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
++++ b/serverless/shell/src/main/java/org/opensearch/serverless/shell/ServerlessBootstrap.java
+@@ -19,6 +19,7 @@
+ import org.opensearch.serverless.nodelog.NodeLogCommitter;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
+ import org.opensearch.serverless.reconcile.ReconcileScheduler;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
+ import org.opensearch.serverless.warm.SearchDrain;
+ import org.opensearch.serverless.warm.SearchWarmup;
+ 
+@@ -418,9 +419,18 @@
+         try {
+             // Publish and release what this node owns, so its shards are claimable at a fresh term the
+             // moment a peer or this node's own restart wants them.
+-            final int handed = loop.handOverAll();
+-            if (handed > 0) {
+-                logger.info("handed over {} shard(s) on shutdown", handed);
++            final var handoff = loop.handOverWriters();
++            final long handed = handoff.releasedCount();
++            if (handoff.shards().isEmpty() == false) {
++                final long withWal = handoff.shards().stream().filter(result -> result.outcome() == Outcome.RELEASED_WITH_WAL).count();
++                final long memberOnly = handoff.shards().stream().filter(result -> result.outcome() == Outcome.MEMBER_RELEASED).count();
++                logger.info(
++                    "Writer shutdown handoff (heads_released={}, with_wal={}, member_only={}, unconfirmed={})",
++                    handed,
++                    withWal,
++                    memberOnly,
++                    handoff.shards().size() - handed - memberOnly
++                );
+             }
+         } catch (Exception e) {
+             logger.warn(
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/WriterHibernationTests.java
+@@ -15,10 +15,13 @@
+ import org.opensearch.core.index.shard.ShardId;
+ import org.opensearch.serverless.cluster.IndexDescriptor;
+ import org.opensearch.serverless.metadata.MetadataPlane;
++import org.opensearch.serverless.metadata.RegisterMap;
+ import org.opensearch.serverless.metadata.ShardHead;
+ import org.opensearch.serverless.ops.DocumentRouting;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
+ import org.opensearch.serverless.reconcile.ReconcileScheduler;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.test.OpenSearchTestCase;
+ 
+@@ -241,20 +244,66 @@
+         }
+     }
+ 
+-    /** A clean shutdown gives back the heads of writers asleep, as it hands over open ones. */
+-    public void testAShutdownGivesBackTheHeadsOfWritersAsleep() throws Exception {
+-        final AtomicLong clock = new AtomicLong(1_000L);
+-        final MetadataPlane plane = plane(clock, 1);
++    public void testShutdownReportsReleasedAndUnconfirmedWriters() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final MetadataPlane plane = plane(clock, 3);
+         try (ServerlessNode node = new ServerlessNode(nodeSettings("shutdown"))) {
+             node.startup().start();
+             node.setMetadataPlane(plane);
+             final BackgroundReconciler loop = loop(node, plane);
+-            writeSome(node, plane, 0, 0, 2);
++            final ShardId sleeping = writeSome(node, plane, 0, 0, 2);
++            final long sleepingTerm = node.reconciler().shard(sleeping).getOperationPrimaryTerm();
+             clock.addAndGet(HIBERNATE_AFTER + 1);
+             loop.tick(clock.get());
+             assertTrue(node.hibernation().isHibernated("alpha", 0));
+-            assertEquals(1, loop.handOverAll());
++            final ShardId open = writeSome(node, plane, 1, 2, 2);
++            final ShardId changed = writeSome(node, plane, 2, 4, 2);
++            final long openTerm = node.reconciler().shard(open).getOperationPrimaryTerm();
++            final long changedTerm = node.reconciler().shard(changed).getOperationPrimaryTerm();
++            final var local = node.localNode();
++            assertTrue(plane.heads().release("alpha", 2, local.getId(), changedTerm, changed.getIndex().getUUID(), local.getEphemeralId()));
++            loop.close();
++            node.activation().closeWriterAdmission();
++            final var report = loop.handOverWriters();
++            assertEquals(local.getId(), report.nodeId());
++            assertEquals(local.getEphemeralId(), report.ephemeralId());
++            assertEquals(2L, report.releasedCount());
++            assertEquals(
++                java.util.Set.of(
++                    new ShardResult(sleeping, sleepingTerm, true, Outcome.RELEASED_WITH_WAL, true),
++                    new ShardResult(open, openTerm, false, Outcome.RELEASED, true),
++                    new ShardResult(changed, changedTerm, false, Outcome.UNCONFIRMED, false)
++                ),
++                java.util.Set.copyOf(report.shards())
++            );
+             assertTrue(plane.heads().read("alpha", 0).map(ShardHead::ownerNodeId).isEmpty());
++            assertTrue(plane.heads().read("alpha", 1).map(ShardHead::ownerNodeId).isEmpty());
++        }
++    }
++
++    public void testAssignmentCleanupFailureDoesNotEraseTheAppliedHead() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final BlobPath base = BlobPath.cleanPath();
++        try (
++            HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
++            ServerlessNode node = new ServerlessNode(nodeSettings("shutdown-cleanup"))
++        ) {
++            final MetadataPlane plane = new MetadataPlane(store, base, clock::get, TTL);
++            plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
++            node.startup().start();
++            node.setMetadataPlane(plane);
++            final BackgroundReconciler loop = loop(node, plane);
++            final ShardId open = writeSome(node, plane, 0, 0, 2);
++            final long term = node.reconciler().shard(open).getOperationPrimaryTerm();
++            loop.close();
++            node.activation().closeWriterAdmission();
++            final String claims = RegisterMap.assignments(base, node.localNode().getId()).buildAsString();
++            store.onNextBlobDelete(claims, RegisterMap.assignmentBlob("alpha", 0), () -> {
++                throw new IllegalStateException("injected post-release assignment cleanup failure");
++            });
++            final var report = loop.handOverWriters();
++            assertEquals(java.util.List.of(new ShardResult(open, term, false, Outcome.RELEASED, false)), report.shards());
++            assertNull(plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
+         }
+     }
+ 
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessFenceTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/ServerlessFenceTests.java
+@@ -21,6 +21,8 @@
+ import org.opensearch.serverless.metadata.MetadataPlane;
+ import org.opensearch.serverless.metadata.RegisterMap;
+ import org.opensearch.serverless.reconcile.BackgroundReconciler;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.Outcome;
++import org.opensearch.serverless.reconcile.WriterHandoffReport.ShardResult;
+ import org.opensearch.serverless.shell.ServerlessNode;
+ import org.opensearch.serverless.write.WriteOutcome;
+ import org.opensearch.test.OpenSearchTestCase;
+@@ -437,6 +439,31 @@
+         }
+     }
+ 
++    public void testShutdownReportsThatSuccessorNeedsTheOutgoingLog() throws Exception {
++        final AtomicLong clock = new AtomicLong(1_000L);
++        final GatedBlobStore store = new GatedBlobStore(new FsBlobStore(1024, createTempDir(), false));
++        final MetadataPlane plane = planeOver(store, clock);
++        createAlpha(plane);
++
++        try (ServerlessNode a = new ServerlessNode(nodeSettings("shutdown-with-wal"))) {
++            final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
++            final ShardId onA = hold(a, plane, loop, clock);
++            final long term = a.reconciler().shard(onA).getOperationPrimaryTerm();
++            a.writes().index(onA, "acknowledged", "{\"msg\":\"acknowledged\"}");
++            store.failWritesUnder("nodelog/");
++            expectThrows(IOException.class, () -> a.writes().index(onA, "refused", "{\"msg\":\"refused\"}"));
++            assertTrue(a.fences().isWriteFenced(onA));
++            store.failWritesUnder(null);
++            loop.close();
++            a.activation().closeWriterAdmission();
++            final var report = loop.handOverWriters();
++            assertEquals(List.of(new ShardResult(onA, term, false, Outcome.RELEASED_WITH_WAL, true)), report.shards());
++            final var head = plane.heads().read("alpha", 0).orElseThrow();
++            assertNull(head.ownerNodeId());
++            assertEquals(List.of(a.localNode().getId()), head.writers());
++        }
++    }
++
+     // ---------------------------------------------------------------- a store that parks on demand
+ 
+     /**
+--- a/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BucketOwnershipTests.java
++++ b/serverless/testkit/src/test/java/org/opensearch/serverless/testkit/BucketOwnershipTests.java
+@@ -91,12 +91,22 @@
+             openOnA.add(shard("logs-b", "uuid-b"));
+ 
+             store.reset();
+-            assertTrue(heads.release("logs-a", 0, "node-a", term, "uuid-a", "eph-a", "node-a"));
++            final var memberOnly = heads.releaseWithEvidence("logs-a", 0, "node-a", term, "uuid-a", "eph-a", "node-a");
++            assertTrue(memberOnly.accepted());
++            assertNull(memberOnly.appliedHead());
+             assertEquals("giving back a member while another is open costs no write", 0, store.registerWrites());
+             assertEquals("node-a", heads.read("logs-b", 0).orElseThrow().ownerNodeId());
+             openOnA.remove(shard("logs-a", "uuid-a"));
+ 
+-            assertTrue(heads.release("logs-b", 0, "node-a", term, "uuid-b", "eph-a", "node-a"));
++            final var stale = heads.releaseWithEvidence("logs-b", 0, "node-a", term + 1, "uuid-b", "eph-a", "node-a");
++            assertFalse(stale.accepted());
++            assertNull(stale.appliedHead());
++            assertEquals("node-a", heads.read("logs-b", 0).orElseThrow().ownerNodeId());
++            final var last = heads.releaseWithEvidence("logs-b", 0, "node-a", term, "uuid-b", "eph-a", "node-a");
++            assertTrue(last.accepted());
++            assertNotNull(last.appliedHead());
++            assertNull(last.appliedHead().ownerNodeId());
++            assertEquals(List.of("node-a"), last.appliedHead().writers());
+             final ShardHead released = heads.read("logs-a", 0).orElseThrow();
+             assertNull("the last member gives the bucket back", released.ownerNodeId());
+             assertEquals("a release keeps the term", term, released.term());

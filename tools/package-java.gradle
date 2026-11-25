@@ -1,0 +1,41 @@
+// Applied with Gradle -I to a checkout of the pinned serverless shell.
+// The resulting directory is a candidate runtime classpath for qualification.
+gradle.projectsEvaluated {
+  def shell = gradle.rootProject.findProject(':serverless:shell')
+  if (shell == null) {
+    return
+  }
+  // Opt in explicitly while this provider is being qualified. The path is
+  // absolute so it does not depend on the Java checkout's location.
+  def peerTlsSource = System.getProperty('operator.peerTlsSource')
+  if (peerTlsSource != null && !peerTlsSource.isBlank()) {
+    shell.sourceSets.main.java.srcDir(peerTlsSource)
+  }
+  def peerTlsTestSource = System.getProperty('operator.peerTlsTestSource')
+  if (peerTlsTestSource != null && !peerTlsTestSource.isBlank()) {
+    def testkit = gradle.rootProject.findProject(':serverless:testkit')
+    testkit.sourceSets.test.java.srcDir(peerTlsTestSource)
+    testkit.tasks.register('operatorPeerTlsTest', Test) {
+      testClassesDirs = testkit.sourceSets.test.output.classesDirs
+      classpath = testkit.sourceSets.test.runtimeClasspath
+      include '**/PeerTlsIntegrationTests.class'
+      include '**/PeerDnsIntegrationTests.class'
+      systemProperty 'tests.security.manager', 'false'
+      systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+      systemProperty 'java.net.preferIPv4Stack', 'true'
+      systemProperty 'operator.tlsFixtures', System.getProperty('operator.tlsFixtures')
+    }
+  }
+  shell.tasks.register('operatorRuntimeBundle', Sync) {
+    dependsOn shell.tasks.named('jar')
+    from shell.tasks.named('jar')
+    from shell.configurations.runtimeClasspath
+    if (Boolean.getBoolean('operator.serverlessBasicAuth')) {
+      def auth = gradle.rootProject.project(':serverless:auth')
+      dependsOn auth.tasks.named('jar')
+      from auth.tasks.named('jar')
+    }
+    into shell.layout.buildDirectory.dir('operator-runtime/lib')
+    duplicatesStrategy = DuplicatesStrategy.FAIL
+  }
+}
