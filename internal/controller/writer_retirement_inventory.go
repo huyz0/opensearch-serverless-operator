@@ -249,3 +249,21 @@ func retirementInventoryEntries(heads []java.WriterHead, victim java.WriterProce
 	}
 	return result, nil
 }
+
+// A closed writer can lose ownership during a store outage. The current
+// inventory may omit a head, but eviction never changes the original journal.
+// After eviction, every original head still needs a newer write and, if its
+// release receipt does not cover it, positive predecessor WAL settlement.
+func writerInventoryAllowsEviction(original, current []v1alpha1.RetiringWriterHead) bool {
+	if original == nil || current == nil || len(current) > len(original) {
+		return false
+	}
+	// Both complete inventories are sorted by their unique durable keys.
+	next := 0
+	for _, head := range original {
+		if next < len(current) && head == current[next] {
+			next++
+		}
+	}
+	return next == len(current)
+}

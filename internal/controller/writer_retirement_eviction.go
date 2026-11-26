@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
-	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -76,7 +75,7 @@ func (b developmentWriterRetirement) evict(ctx context.Context, instance *v1alph
 	if err != nil {
 		return false, err
 	}
-	if current.Heads == nil || journal.HeadInventory.Heads == nil || !slices.Equal(current.Heads, journal.HeadInventory.Heads) {
+	if !writerInventoryAllowsEviction(journal.HeadInventory.Heads, current.Heads) {
 		return false, errWriterEvictionHeadsChanged
 	}
 	bound, err := b.bindJournal(ctx, instance, op)

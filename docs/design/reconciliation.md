@@ -286,6 +286,13 @@ next reconcile. A complete scan still runs within one JVM lease. The
 controller keeps the operation on hold when the inventory exceeds the
 journal limit or contains ambiguous ownership.
 
+An expired lease can leave an admission-closed writer owning fewer
+heads after the store recovers. A complete rescan may omit original
+heads. Every head the writer still owns must match the journal exactly.
+The operator retains the original inventory and verifies every one of
+those heads after eviction. New physical keys and changes to a retained
+head still hold eviction at `WriterHeadsChanged`.
+
 After eviction, read the receipt for the retired JVM through an
 authenticated serving index JVM. Match each recorded independent shard
 by index UUID, shard number and original term. Save the outcomes against

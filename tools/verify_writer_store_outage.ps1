@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Kubeconfig,
     [Parameter(Mandatory)][string]$FixtureDirectory,
     [switch]$VerifyRecovery,
-    [ValidateSet('BeforeEviction', 'Throttle', 'AfterDispatch')][string]$Fault = 'BeforeEviction'
+    [ValidateSet('BeforeEviction', 'Throttle', 'AfterDispatch', 'ReceiptWindow')][string]$Fault = 'BeforeEviction'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -99,6 +99,11 @@ function verifyThrottling {
         $javaFault = waitFor {
             observeJavaFault 'SlowDown' $survivor.status.podIP $faultStart
         } 20 'a throttled S3 request from the original surviving Java Pod'
+        if ($namespace -eq 'operator-writer-s3-receipt-window') {
+            # Allow the original lease to lapse so the fixture exercises a smaller head inventory.
+            $remaining = 45 - ([DateTime]::UtcNow - $faultStart).TotalSeconds
+            if ($remaining -gt 0) { Start-Sleep -Seconds ([Math]::Ceiling($remaining)) }
+        }
         $null = assertRetirementHeld
         $holdAt = [DateTime]::UtcNow
     } finally {
@@ -167,6 +172,64 @@ function verifyPostDispatchOutage {
         readyReason=($held.status.conditions | Where-Object type -eq Ready).reason; acknowledgedWrite=$ack.ack} |
         ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $work 'store-outage-hold.json') -Encoding ascii
     Write-Host 'S3 connections failed after eviction dispatch. The operation observed the victim gone and held its claim until recovery.'
+}
+
+function verifyReceiptWindowOutage {
+    $null = assertRetirementHeld
+    $victim = namespaced get pod $fixture.victim.pod -o json | ConvertFrom-Json
+    if (!$initial.status.writerRetirement.evictionArmed -or !$config.enableEviction -or
+        $victim.metadata.uid -ne $fixture.victim.uid -or !$victim.status.podIP -or
+        $initial.status.writerRetirement.releaseReceipt -or $initial.status.writerRetirement.receiptMissingAt) {
+        throw 'Expected the exact writer awaiting eviction with no receipt observation'
+    }
+
+    $hostName = "$($survivor.spec.hostname).$($fixture.peerSuffix)"
+    $headPath = "/_serverless/writer_heads/$($fixture.victim.node)/$($fixture.victim.ephemeral)"
+    $query = 'curl -fsS --max-time 8 --cacert /jvm/ca.crt --resolve "$1:9200:$2" --user "handoff-reader:$(cat /reader/password)" "https://$1:9200$3"'
+    $rescanned = waitFor {
+        $sample = & kubectl --kubeconfig $kube --request-timeout=12s -n $namespace exec probe -- sh -c $query shell $hostName $survivor.status.podIP $headPath 2>$null
+        if (!$LASTEXITCODE -and $sample) {
+            $current = $sample | ConvertFrom-Json
+            if ($current.version -eq 1 -and $current.node_id -ceq $fixture.victim.node -and
+                $current.ephemeral_id -ceq $fixture.victim.ephemeral -and !$current.after -and !$current.next_after -and
+                $null -ne $current.heads -and $current.heads.Count -eq 0) { $current }
+        }
+    } 70 'a complete rescan showing the original JVM no longer owns its journaled head'
+    if ($initial.status.writerRetirement.headInventory.heads.Count -ne 1) { throw 'Expected the original one-head journal' }
+    $rescanned | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $work 'store-throttle-recovered-inventory.json') -Encoding ascii
+
+    try {
+        $armedAt = [DateTime]::UtcNow
+        setProxyMode 'disconnect-on-receipt'
+        Set-Content -LiteralPath (Join-Path $work 'watching-eviction.txt') -Value 'Armed S3 shutdown-receipt trigger' -Encoding ascii
+        $trigger = waitFor {
+            observeJavaFault 'ReceiptWriteDisconnect' $victim.status.podIP $armedAt
+        } 110 'the exact evicted writer to attempt its S3 receipt PUT'
+        $held = waitFor {
+            $operation = readOperation
+            $journal = $operation.status.writerRetirement
+            $instance = namespaced get opensearchserverless catalog -o json | ConvertFrom-Json
+            if ($operation.metadata.uid -ne $initial.metadata.uid -or $operation.status.phase -ne 'Running' -or
+                $journal.releaseReceipt -or $journal.receiptMissingAt -or $journal.successors.Count -gt 0 -or
+                ($journal.headInventory.heads | ConvertTo-Json -Compress) -cne ($initial.status.writerRetirement.headInventory.heads | ConvertTo-Json -Compress) -or
+                $instance.metadata.uid -ne $fixture.instanceUID -or $instance.status.activeOperation.uid -ne $operation.metadata.uid) {
+                throw 'Retirement changed its recovery obligations or recorded a receipt outcome during the outage'
+            }
+            $release = $operation.status.conditions | Where-Object type -eq WriterReleaseReady
+            if ($journal.victimGone -and $release.reason -eq 'ReceiptUnavailable') { $operation }
+        } 100 'victim disappearance and a held receipt readback'
+        if ((storeHTTPStatus) -ne '000') { throw 'The S3 connection did not stay interrupted through receipt readback' }
+        $holdAt = [DateTime]::UtcNow
+        $javaFault = @(observeJavaFault 'Disconnect' $survivor.status.podIP $armedAt)
+    } finally {
+        setProxyMode 'healthy'
+    }
+    if ((storeHTTPStatus) -ne '200') { throw 'The fixture store did not recover' }
+    @{operationUID=$held.metadata.uid; victimUID=$fixture.victim.uid; trigger=@($trigger); armedAt=$armedAt;
+        holdConfirmedAt=$holdAt; restoredAt=[DateTime]::UtcNow; javaRequests=$javaFault;
+        receiptRecordedAtFaultStart=$false; releaseReason='ReceiptUnavailable'; acknowledgedWrite=$ack.ack} |
+        ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $work 'store-outage-hold.json') -Encoding ascii
+    Write-Host 'The evicted writer triggered the S3 disconnect during receipt publication. Receipt readback held the original claim and inventory.'
 }
 
 function envoyRequest([string]$Method, [string]$URL, [string]$Body) {
@@ -251,9 +314,14 @@ function verifyRecovery {
     if (!$done.status.writerRetirement.releaseReceipt -and !$successors[0].predecessorWALSettled) {
         throw 'Expected either a release receipt or positive predecessor WAL settlement evidence'
     }
+    if ($Fault -eq 'ReceiptWindow' -and ($done.status.writerRetirement.releaseReceipt -or
+        !$done.status.writerRetirement.receiptMissingAt -or !$successors[0].predecessorWALSettled)) {
+        throw 'Expected confirmed receipt absence after restoration and durable WAL settlement on the successor'
+    }
 
     @{outage=$hold; successorWrite=$newWrite; successorProof=$successors[0]; search=$traffic.search;
-        receiptRecorded=[bool]$done.status.writerRetirement.releaseReceipt; phase=$done.status.phase; claimReleased=$true} |
+        receiptRecorded=[bool]$done.status.writerRetirement.releaseReceipt;
+        receiptMissingAt=$done.status.writerRetirement.receiptMissingAt; phase=$done.status.phase; claimReleased=$true} |
         ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $work 'store-outage-result.json') -Encoding ascii
     Write-Host 'The operator evicted the exact writer, verified the newer-term write, and released the claim. Envoy search returned all three documents.'
 }
@@ -266,10 +334,11 @@ $fixture = Get-Content -Raw -LiteralPath (Join-Path $work 'fixture.json') | Conv
 $namespace = $fixture.namespace
 $expectedNamespace = switch ($Fault) {
     'BeforeEviction' { 'operator-writer-store-outage' }
-    'Throttle' { 'operator-writer-s3-faults' }
+    'Throttle' { 'operator-writer-s3-faults'; 'operator-writer-s3-receipt-window' }
     'AfterDispatch' { 'operator-writer-s3-post-dispatch' }
+    'ReceiptWindow' { 'operator-writer-s3-receipt-window' }
 }
-if ($namespace -ne $expectedNamespace) { throw 'Fixture namespace does not match the selected fault' }
+if ($namespace -notin $expectedNamespace) { throw 'Fixture namespace does not match the selected fault' }
 $ack = Get-Content -Raw -LiteralPath (Join-Path $work 'unpublished-ack-proof.json') | ConvertFrom-Json
 if ($ack.ack._id -ne 'unpublished' -or $ack.ack.durable -ne 'write-ahead log' -or
     $ack.ack._node -ne $fixture.victim.node -or $ack.baseline.sha256 -ne $ack.afterAck.sha256) {
@@ -292,7 +361,9 @@ if ($Fault -ne 'BeforeEviction') {
         $storeBefore.metadata.labels.app -ne 's3-backend' -or (storeHTTPStatus) -ne '200') {
         throw 'Expected the isolated S3 fault proxy, exact survivor, and reachable backing store'
     }
-    if ($Fault -eq 'AfterDispatch') {
+    if ($Fault -eq 'ReceiptWindow') {
+        verifyReceiptWindowOutage
+    } elseif ($Fault -eq 'AfterDispatch') {
         verifyPostDispatchOutage
     } else {
         if ($config.enableEviction -ne $false -or $initial.status.writerRetirement.evictionArmed) {

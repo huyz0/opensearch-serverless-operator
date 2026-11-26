@@ -1,5 +1,19 @@
 # Task handoff
 
+Writer retirement now accepts a complete pre-eviction scan that only
+omits heads the closed writer no longer owns. The original inventory
+stays in the journal, and new or changed heads still block eviction.
+The Kind run reproduced the smaller inventory after 48 seconds of S3
+throttling. The original Pod was then evicted and its first receipt PUT
+triggered an S3 outage. The operator held the claim with
+`ReceiptUnavailable` until the store recovered. The original survivor
+accepted a term-3 write through Envoy with verified TLS and Basic Auth,
+and search returned all acknowledged documents. The operation recorded
+settled predecessor WAL and confirmed receipt absence, succeeded, and
+released the claim. Go tests and vet, 30 shuffled writer test runs,
+PowerShell parsing, and the plan check passed.
+[Receipt-window verification](verification.md#s3-outage-during-shutdown-receipt-publication)
+
 The first-instance guide covers secure setup, a write and search check,
 different warm-spare counts by role/AZ, and selector promotion and
 rollback. `kubectl get` displays instance availability, fleet intent,

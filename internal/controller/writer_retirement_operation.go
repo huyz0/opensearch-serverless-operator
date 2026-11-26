@@ -346,7 +346,7 @@ func (r *OperationReconciler) advanceWriterEviction(ctx context.Context, instanc
 		return r.recordWriterPodGone(ctx, op)
 	}
 	if errors.Is(err, errWriterEvictionHeadsChanged) {
-		return wait("Running", "WriterHeadsChanged", "Durable writer heads differ from the recorded inventory and need explicit recovery")
+		return wait("Running", "WriterHeadsChanged", "The closed writer owns a new or changed durable head. Eviction is held to preserve the original recovery obligations")
 	}
 	if errors.Is(err, errWriterEvictionRestartPolicy) {
 		return wait("Running", "WriterEvictionRestartPolicy", err.Error())

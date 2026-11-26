@@ -57,6 +57,34 @@ func TestRetirementInventoryRecordsPhysicalHeadsAndRejectsAmbiguity(t *testing.T
 	}
 }
 
+func TestWriterInventoryAllowsOnlyUnchangedRemainingHeads(t *testing.T) {
+	a := v1alpha1.RetiringWriterHead{Key: "a", Index: "docs", IndexUUID: "uuid", Shard: 0, Term: 2}
+	b := v1alpha1.RetiringWriterHead{Key: "b", Index: "docs", IndexUUID: "uuid", Shard: 1, Term: 3}
+	changed := b
+	changed.Term++
+	recreated := b
+	recreated.IndexUUID = "recreated-index"
+	for _, test := range []struct {
+		name    string
+		current []v1alpha1.RetiringWriterHead
+		allow   bool
+	}{
+		{"unchanged", []v1alpha1.RetiringWriterHead{a, b}, true},
+		{"one removed", []v1alpha1.RetiringWriterHead{b}, true},
+		{"all removed", []v1alpha1.RetiringWriterHead{}, true},
+		{"incomplete", nil, false},
+		{"remaining head advanced", []v1alpha1.RetiringWriterHead{changed}, false},
+		{"index recreated", []v1alpha1.RetiringWriterHead{recreated}, false},
+		{"unrecorded key", []v1alpha1.RetiringWriterHead{{Key: "new"}}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := writerInventoryAllowsEviction([]v1alpha1.RetiringWriterHead{a, b}, test.current); got != test.allow {
+				t.Fatalf("eviction allowed = %t, want %t", got, test.allow)
+			}
+		})
+	}
+}
+
 func TestOpenWriterHeadScanRejectsBucketAndIncompleteInventory(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

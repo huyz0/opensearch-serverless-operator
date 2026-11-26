@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,7 @@ func main() {
 		log.Fatal(err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	var receiptFault atomic.Bool
 	server := &http.Server{
 		Addr:              ":8333",
 		ReadHeaderTimeout: 5 * time.Second,
@@ -35,6 +37,14 @@ func main() {
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				http.Error(w, "cannot read fixture mode", http.StatusInternalServerError)
 				return
+			}
+			if string(mode) == "disconnect-on-receipt" {
+				if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/writer-handoffs/") && receiptFault.CompareAndSwap(false, true) {
+					logFault(r, "ReceiptWriteDisconnect")
+				}
+				if receiptFault.Load() {
+					mode = []byte("disconnect")
+				}
 			}
 			switch string(mode) {
 			case "throttle":
@@ -60,7 +70,7 @@ func main() {
 
 func setMode(mode string) error {
 	switch mode {
-	case "healthy", "throttle", "disconnect":
+	case "healthy", "throttle", "disconnect", "disconnect-on-receipt":
 	default:
 		return errors.New("unknown fixture mode")
 	}

@@ -593,9 +593,10 @@ before its page is read, it may be absent from that scan.
 
 With automatic eviction enabled, the manager commits
 `status.writerRetirement.evictionArmed` before dispatch. It rescans the
-closed writer's heads and compares the physical keys and terms against the
-recorded inventory. A difference sets `WriterHeadsChanged` and holds the
-operation for explicit recovery. The controller checks the surviving Java
+closed writer's heads against the recorded inventory. A complete scan can
+omit heads the writer no longer owns. The original inventory stays in the
+journal and all of its heads still require successor proof. A new or
+changed head sets `WriterHeadsChanged` and holds eviction. The controller checks the surviving Java
 peer leases, index serving floors, signed Envoy proof and the matching zonal
 PDB before submitting `policy/v1` Eviction. Republish the Envoy observation
 after admission closes if the last statement expires or its versions

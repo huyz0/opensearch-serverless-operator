@@ -708,7 +708,51 @@ pre-eviction test. The fault proxy image resolved in Kind as
 `sha256:1588f9df0d92f13ccc964dc106fefbfd5dd3bbd77ec9f906347b20d6277acde2`.
 The sustained post-dispatch outage started after the release receipt
 was already recorded. The interval between eviction acceptance and
-receipt recording still lacks a complete outage run.
+receipt recording is exercised separately below.
+
+### S3 outage during shutdown receipt publication
+
+Prepare a fresh `operator-writer-s3-receipt-window` fixture with the
+fault proxy and the signed writer setup above. Run `-Fault Throttle`
+after recording the initial inventory and acknowledging the WAL-only
+write. Wait for the initial signed report to expire before starting
+`-Fault ReceiptWindow`. This mode verifies that the retiring JVM owns
+no heads after throttling and that the original one-head journal is
+still present. When it writes `watching-eviction.txt`, publish fresh
+signed Envoy evidence for the exact operation after the surviving
+index Pod is Ready and its disruption budget has recovered.
+
+The proxy waits for the retiring JVM's first S3 receipt `PUT` during
+shutdown, disconnects that request, and cuts off subsequent S3 requests.
+The drill requires the original Pod to disappear while receipt readback
+reports `ReceiptUnavailable`. The claim and original inventory must
+remain intact. Once the test restores S3, run
+`-Fault ReceiptWindow -VerifyRecovery`. This requires a confirmed
+missing receipt, a newer-term successor write with settled predecessor
+WAL, and search readback of every acknowledged document through Envoy.
+
+In Kind 1.32.0, the proxy throttled requests for 48 seconds. The
+original one-head journal stayed intact while an independent scan
+returned zero heads for the retiring JVM. The manager accepted that
+rescan and evicted the original Pod after fresh signed Envoy evidence.
+The retiring JVM's first receipt PUT triggered the disconnect, and the
+proxy logged 32 interrupted requests from the original survivor. With
+the victim gone and S3 still unreachable, the operator reported
+`ReceiptUnavailable` and retained the original claim. It recorded
+receipt absence only after S3 access returned.
+
+The survivor then acknowledged a term-3 write through the Envoy index
+route using verified TLS and Basic Auth. Search through the separate
+authenticated route returned the seed, the WAL-only document, and the
+successor write. The journal verified settled predecessor WAL for its
+original head, reached `Succeeded`, and released the claim.
+
+The manager image was
+`sha256:ce1e32196f61c60e8bfde5c8d6c109ad669d9a8a1670b52cae672217ddf96e6a`.
+The fault proxy image was
+`sha256:76b9f5839bcc977bbc7f7655ff36ca3a28d9d51a61a202481e1c0fed5c9068bd`.
+The Java image matched the pre-eviction fixture. Local Go tests and vet,
+30 shuffled writer test runs, PowerShell parsing, and plan checks passed.
 
 ### Partial writer receipt recovery
 
