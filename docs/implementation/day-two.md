@@ -27,6 +27,23 @@ operation. Use `kubectl -n <namespace> get opensearchserverlessoperations -o wid
 to see its phase and reason. During an active rollout, read the Service
 selectors for live routing. [Preview both role routes](first-instance.md#preview-promotion-and-rollback)
 
+To explain a claimed operation or provisioning hold using the diagnostic
+Role, run the read-only command from the repository root.
+
+```sh
+NS=operator-development
+INSTANCE=catalog
+python tools/diagnose_operator.py "$INSTANCE" -n "$NS"
+```
+
+It prints the exact operation or Pod UID, the current reason, and the
+next safe check for common holds. The condition state age measures how
+long the condition has had its current True, False, or Unknown value.
+Kubernetes can change the reason within that state. Provisioning attempt
+age starts when the attempt was recorded. [Provisioning and capacity](#provisioning-and-capacity)
+Pass `--operation <name>` to inspect a named request that is still waiting
+for the instance claim.
+
 Set the namespace and instance name before running these checks.
 
 ```sh

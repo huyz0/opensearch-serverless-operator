@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -21,16 +22,25 @@ const weightedAdmission = 1
 
 // ConfigureDevelopmentWeightedRollout restricts weighted writes to two
 // deployment-approved role routes on the configured development instance.
-func (r *OperationReconciler) ConfigureDevelopmentWeightedRollout(observer *InstanceReconciler, searchRoute, ingestRoute string, key ed25519.PublicKey) error {
+func (r *OperationReconciler) ConfigureDevelopmentWeightedRollout(observer *InstanceReconciler, searchRoute, ingestRoute, frontend, frontendUID string, key ed25519.PublicKey) error {
 	if r.RolloutInstanceName == "" || r.RolloutEvidence == nil || observer == nil || len(key) != ed25519.PublicKeySize ||
 		searchRoute == ingestRoute || len(validation.IsDNS1123Subdomain(searchRoute)) != 0 || len(validation.IsDNS1123Subdomain(ingestRoute)) != 0 {
 		return fmt.Errorf("weighted rollout requires development rollout and two distinct HTTPRoute names")
 	}
 	r.weightedRoutes = map[string]string{"search": searchRoute, "ingest": ingestRoute}
+	r.weightedGatewayMissing = frontend == "" && frontendUID == ""
+	if r.weightedGatewayMissing {
+		return nil
+	}
+	namespace, name, ok := strings.Cut(frontend, "/")
+	if !ok || len(validation.IsDNS1123Label(namespace)) != 0 || len(validation.IsDNS1035Label(name)) != 0 || frontendUID == "" {
+		return fmt.Errorf("weighted rollout requires a pinned Gateway Service namespace/name and UID")
+	}
 	qualification := observer.fleetQualification()
 	r.weightedRuntimeSupported = qualification.supportsDevelopmentPodHTTP
 	tls := rolloutTLSQualification{http: observer.qualifyHTTPRotation, peer: observer.qualifyPeerRotation}
-	r.weightedEvidence = r.liveWeightedRolloutEvidence(qualification, tls, signedRolloutPlatformCheck(r.Core, key), key)
+	gateway := weightedGatewayFrontend{namespace: namespace, name: name, uid: types.UID(frontendUID)}
+	r.weightedEvidence = r.liveWeightedRolloutEvidence(qualification, tls, signedRolloutPlatformCheck(r.Core, key), key, gateway)
 	return nil
 }
 
@@ -47,7 +57,7 @@ func (r *OperationReconciler) supportsWeightedRuntime(instance *v1alpha1.OpenSea
 // liveWeightedRolloutEvidence combines application and platform qualification
 // for each fleet that will still receive traffic with independent proxy
 // observations. A fleet being removed may be unhealthy.
-func (r *OperationReconciler) liveWeightedRolloutEvidence(observer fleetQualification, tls rolloutTLSQualification, verify rolloutPlatformCheck, key ed25519.PublicKey) weightStepEvidence {
+func (r *OperationReconciler) liveWeightedRolloutEvidence(observer fleetQualification, tls rolloutTLSQualification, verify rolloutPlatformCheck, key ed25519.PublicKey, gateway weightedGatewayFrontend) weightStepEvidence {
 	trustedKey := append(ed25519.PublicKey(nil), key...)
 	return func(ctx context.Context, instance *v1alpha1.OpenSearchServerless, operation *v1alpha1.OpenSearchServerlessOperation, intent rollout.WeightIntent, route observedWeightRoute) (weightedRolloutEvidence, error) {
 		if observer.core == nil || instance == nil || verify == nil || observer.roleProbe(intent.Role) == nil || len(trustedKey) != ed25519.PublicKeySize {
@@ -76,9 +86,12 @@ func (r *OperationReconciler) liveWeightedRolloutEvidence(observer fleetQualific
 			auth = credential.RouteAuthIdentity
 		}
 		proxyUnchanged, err := readWeightProxyEvidence(ctx, r.Core, trustedKey, instance, operation, route, auth, &snapshot.WeightSnapshot)
+		if err == nil {
+			proxyUnchanged, err = gateway.bindEvidence(ctx, r.Core, r.Discovery, snapshot.ExpectedProxyUIDs, proxyUnchanged)
+		}
 		if err != nil {
-			// Missing or stale evidence leaves the planner on Hold. A step
-			// already applied is handled by the journal's read-back path.
+			snapshot.ExpectedProxyUIDs, snapshot.Proxies = nil, nil
+			snapshot.proxyEvidenceMissing = true
 			return snapshot, nil
 		}
 		if err := tls.http(ctx, instance, operation.Spec.TargetFleet, operation.Spec.ExpectedServingFleetByRole[intent.Role], operation.Spec.Action == "Promote"); err != nil {

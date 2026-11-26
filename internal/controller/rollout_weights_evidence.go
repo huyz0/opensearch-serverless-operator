@@ -4,13 +4,56 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
+	"maps"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	typedcore "k8s.io/client-go/kubernetes/typed/core/v1"
+	typeddiscovery "k8s.io/client-go/kubernetes/typed/discovery/v1"
 
 	"github.com/huyz0/opensearch-serverless-operator/api/v1alpha1"
 	"github.com/huyz0/opensearch-serverless-operator/internal/rollout"
 )
+
+type weightedGatewayFrontend struct {
+	namespace, name string
+	uid             types.UID
+}
+
+// A signed list can outlive its proxy cohort. Re-read both the pinned
+// frontend endpoints and their Pods, including before using cached evidence.
+func (gateway weightedGatewayFrontend) bindEvidence(ctx context.Context, core typedcore.CoreV1Interface, discovery typeddiscovery.DiscoveryV1Interface, expected []string, reportUnchanged func(context.Context) bool) (func(context.Context) bool, error) {
+	observe := func(ctx context.Context) (map[string]string, error) {
+		current, err := rollout.ObserveEnvoyGatewayEndpoints(ctx, core, discovery, gateway.namespace, gateway.name, gateway.uid)
+		if err != nil || len(expected) == 0 || len(expected) > 128 || len(current.UIDs) != len(expected) {
+			return nil, fmt.Errorf("signed proxy cohort differs from the pinned Gateway endpoints")
+		}
+		for _, uid := range expected {
+			name, present := current.PodNames[uid]
+			if !present {
+				return nil, fmt.Errorf("signed proxy is no longer a ready Gateway endpoint")
+			}
+			pod, err := core.Pods(gateway.namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil || string(pod.UID) != uid || pod.ResourceVersion == "" || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || !podReadyForServing(pod) {
+				return nil, fmt.Errorf("signed Gateway proxy Pod is no longer ready")
+			}
+			current.Versions["pod/"+uid] = pod.ResourceVersion
+		}
+		return current.Versions, nil
+	}
+	versions, err := observe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context) bool {
+		if !reportUnchanged(ctx) {
+			return false
+		}
+		latest, err := observe(ctx)
+		return err == nil && maps.Equal(versions, latest)
+	}, nil
+}
 
 // readWeightProxyEvidence fills the planner snapshot from namespaced signed
 // evidence. The caller supplies the already verified route and trusted key.

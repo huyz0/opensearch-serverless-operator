@@ -23,7 +23,8 @@ type weightStepEvidence func(context.Context, *v1alpha1.OpenSearchServerless, *v
 
 type weightedRolloutEvidence struct {
 	rollout.WeightSnapshot
-	unchanged func(context.Context) bool
+	proxyEvidenceMissing bool
+	unchanged            func(context.Context) bool
 }
 
 type weightedProgress struct {
@@ -251,6 +252,9 @@ func (r *OperationReconciler) executeWeightedRolloutStep(ctx context.Context, re
 		snapshot, err = evidence(ctx, &instance, &operation, intent, live)
 		if err != nil {
 			return rollout.WeightAction{}, false, err
+		}
+		if snapshot.proxyEvidenceMissing {
+			return rollout.WeightAction{Kind: rollout.Hold, Reason: "ProxyEvidenceIncomplete"}, false, nil
 		}
 		snapshot.Now, snapshot.Route = r.weightNow(), live.WeightRouteObservation
 		snapshot.ClaimInstanceUID, snapshot.ClaimOperationUID = intent.InstanceUID, intent.OperationUID

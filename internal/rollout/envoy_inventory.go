@@ -169,6 +169,7 @@ func (s KubernetesEnvoyInventory) captureServingTunnels(ctx context.Context, inv
 type GatewayReplicaObservation struct {
 	UIDs     map[string]bool
 	Versions map[string]string
+	PodNames map[string]string
 }
 
 // ObserveEnvoyGatewayEndpoints independently reads every currently serving
@@ -194,7 +195,10 @@ func ObserveEnvoyGatewayEndpoints(ctx context.Context, core typedcore.CoreV1Inte
 	if len(list.Items) == 0 || len(list.Items) > 128 || list.Continue != "" {
 		return GatewayReplicaObservation{}, fmt.Errorf("Gateway Service endpoint inventory is incomplete")
 	}
-	observation := GatewayReplicaObservation{UIDs: make(map[string]bool), Versions: map[string]string{"service/" + string(service.UID): service.ResourceVersion}}
+	observation := GatewayReplicaObservation{
+		UIDs: make(map[string]bool), PodNames: make(map[string]string),
+		Versions: map[string]string{"service/" + string(service.UID): service.ResourceVersion},
+	}
 	for _, slice := range list.Items {
 		owner := metav1.GetControllerOf(&slice)
 		if owner == nil || owner.UID != service.UID || owner.Name != service.Name || owner.Kind != "Service" ||
@@ -216,6 +220,7 @@ func ObserveEnvoyGatewayEndpoints(ctx context.Context, core typedcore.CoreV1Inte
 				return GatewayReplicaObservation{}, fmt.Errorf("ready Gateway endpoint has no Pod identity")
 			}
 			observation.UIDs[string(ref.UID)] = true
+			observation.PodNames[string(ref.UID)] = ref.Name
 		}
 	}
 	return observation, nil

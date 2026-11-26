@@ -36,6 +36,7 @@ type OperationReconciler struct {
 	RolloutEvidence              rolloutEvidenceReader
 	RolloutPodDomain             func(*v1alpha1.OpenSearchServerless) (string, error)
 	weightedRoutes               map[string]string
+	weightedGatewayMissing       bool
 	rolloutAuthSecrets           map[string]string
 	rolloutRouteURLs             map[string]string
 	weightedRuntimeSupported     func(*v1alpha1.OpenSearchServerless) bool

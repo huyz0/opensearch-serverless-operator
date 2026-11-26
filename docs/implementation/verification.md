@@ -2313,8 +2313,59 @@ The signed reports contained another 60,480 successful process-identity
 probes across the observed weight stages. These larger bursts only
 covered windows where the proxy endpoint set matched the route.
 The live fixture used fresh, signed observations supplied by a test
-verifier. Production proxy collection, ALB, faulted Gateway replicas,
-and arbitrary rainbow weight schedules remain open.
+verifier. Production proxy collection, ALB, and arbitrary rainbow
+weight schedules remain open.
+
+### Authenticated Envoy replica loss during weighted cutover
+
+Use the disposable `kind-oss-secure-install` context and
+`operator-envoy-loss-replay` namespace. Configure the [weighted HTTPS profile](development-rollout.md#enable-weighted-bluegreen-execution)
+with the `secure-rollout` Gateway, two Envoy replicas, and three Ready
+Java Pods in each of `initial` and `green`. Mount a Pod volume at the
+dedicated test store's data directory so a container restart preserves
+the test data.
+The fixture must publish both role hosts, retain the `warm-drill` seed
+document `1` with message `secure warmup`, and configure the `rollout-login`
+credential and the `tls-probe` Pod used for direct Java checks.
+
+Run `python tools/verify_envoy_replica_loss.py --fixture <directory> --namespace operator-envoy-loss-replay`.
+The fixture directory contains the Kind kubeconfig, `edge.crt`, the
+fixture password in `config/app-a`, the Ed25519 key in `rollout-signing.pem`,
+the public key in `weighted-platform-key.txt`, and the built Windows
+`observer.exe` and `publisher.exe` binaries. Keep those credentials
+outside source control.
+
+For each transition, the script captures fresh evidence on a prepared
+weight step, removes one exact Envoy replica, then submits the report
+that still names the removed replica. The operation must hold its claim
+and both route weights must stay fixed. The drill waits for a Ready
+replacement and publishes new evidence for the new serving cohort.
+Clients deliberately reuse HTTPS connections to the targeted proxy,
+then reconnect to the other proxy after a transport failure. The trace
+records separate index and search request outcomes, time to first
+successful request after Pod deletion was requested, and time until claim release. The
+search route must return every acknowledged test document after rollback.
+The script saves requests as they complete in `events.jsonl` and writes
+the combined result to `trace.json`. If the fixture is still intact,
+`--resume-promotion` resumes the saved operation and retains the recorded
+acknowledgments.
+
+The single-node Kind replay used Envoy Gateway 1.8.6 and verified TLS
+and Basic Auth on both routes. On promotion and rollback, the operator
+rejected the stale proxy cohort and kept both route weights and the
+instance claim unchanged. Fresh evidence covering the replacement let
+promotion finish on green and rollback return to the original fleet.
+
+| Transition | Search requests | Index requests | Search recovered | Index recovered | Claim released |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Promotion | 539 | 132 | 1.71 s | 3.07 s | 107.89 s |
+| Rollback | 188 | 46 | 1.79 s | 2.90 s | 64.99 s |
+
+Each route had one transport failure per transition and zero HTTP
+errors. Final search returned 177 expected documents, including the
+seed and every acknowledged write. Docker Desktop interrupted an
+earlier attempt and its store lost the fixture data. The figures above
+come from the fresh fixture, including the saved promotion trace.
 
 ### Configurable weighted promotion stages
 

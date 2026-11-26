@@ -1,5 +1,20 @@
 # Task handoff
 
+Weighted promotion and rollback now validate signed proxy evidence
+against the live Ready Pod UIDs behind a pinned Gateway Service. In
+single-node Kind, deleting one of two Envoy replicas during each
+transition held the claim and both route weights until evidence covered
+the replacement. Authenticated search and indexing each observed one
+transport failure per transition and recovered through the surviving
+proxy. After rollback, search returned the seed and every acknowledged
+write. The controller and Pod lifecycle API-server suites passed.
+[Replica-loss verification](verification.md#authenticated-envoy-replica-loss-during-weighted-cutover)
+
+The read-only diagnostics command shows the claimed operation, the
+affected writer or provisioning attempt, the recorded reason and age,
+and the next safe check. It can also inspect a named request that is
+waiting for a claim. [Day-two diagnostics](day-two.md)
+
 Writer retirement now accepts a complete pre-eviction scan that only
 omits heads the closed writer no longer owns. The original inventory
 stays in the journal, and new or changed heads still block eviction.

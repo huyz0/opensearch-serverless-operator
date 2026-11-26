@@ -46,6 +46,7 @@ jobs:
           python tools/verify_plan.py
           python tools/test_verify_plan.py
           python tools/test_preview_operator_change.py
+          python tools/test_diagnose_operator.py
 
   development-release:
     runs-on: ubuntu-24.04

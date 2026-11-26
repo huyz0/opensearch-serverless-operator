@@ -40,6 +40,7 @@ func main() {
 	var rolloutInstance, rolloutSearchURL, rolloutIngestURL, rolloutKey, rolloutRouteCA string
 	var rolloutSearchAuthSecret, rolloutIngestAuthSecret string
 	var rolloutSearchHTTPRoute, rolloutIngestHTTPRoute string
+	var rolloutGatewayService, rolloutGatewayServiceUID string
 	var writerRetirementConfig string
 	var leaderElection bool
 	var developmentGatedPods bool
@@ -88,6 +89,8 @@ func main() {
 	flag.StringVar(&rolloutIngestAuthSecret, "development-rollout-ingest-auth-secret", "", "Namespaced client credential Secret for the ingest rollout route")
 	flag.StringVar(&rolloutSearchHTTPRoute, "development-rollout-search-httproute", "", "Approved HTTPRoute for weighted search traffic")
 	flag.StringVar(&rolloutIngestHTTPRoute, "development-rollout-ingest-httproute", "", "Approved HTTPRoute for weighted indexing traffic")
+	flag.StringVar(&rolloutGatewayService, "development-rollout-gateway-service", "", "Approved weighted gateway Service as namespace/name")
+	flag.StringVar(&rolloutGatewayServiceUID, "development-rollout-gateway-service-uid", "", "UID of the approved weighted gateway Service")
 	flag.StringVar(&writerRetirementConfig, "development-writer-retirement-config", "", "JSON binding for one development instance's writer withdrawal and preparation drill")
 	logging := zap.Options{}
 	logging.BindFlags(flag.CommandLine)
@@ -232,7 +235,8 @@ func main() {
 		operationReconciler.ConfigureDevelopmentSecurityAccounts(instanceReconciler, manager.GetAPIReader())
 	}
 	if rolloutInstance != "" || rolloutSearchURL != "" || rolloutIngestURL != "" || rolloutKey != "" || rolloutRouteCA != "" ||
-		rolloutSearchHTTPRoute != "" || rolloutIngestHTTPRoute != "" || rolloutSearchAuthSecret != "" || rolloutIngestAuthSecret != "" {
+		rolloutSearchHTTPRoute != "" || rolloutIngestHTTPRoute != "" || rolloutSearchAuthSecret != "" || rolloutIngestAuthSecret != "" ||
+		rolloutGatewayService != "" || rolloutGatewayServiceUID != "" {
 		if !leaderElection {
 			ctrl.Log.Error(nil, "development rollout requires leader election")
 			os.Exit(1)
@@ -252,8 +256,8 @@ func main() {
 			os.Exit(1)
 		}
 		instanceReconciler.ConfigureDevelopmentFleetRetirement(rolloutInstance, key)
-		if rolloutSearchHTTPRoute != "" || rolloutIngestHTTPRoute != "" {
-			if err := operationReconciler.ConfigureDevelopmentWeightedRollout(instanceReconciler, rolloutSearchHTTPRoute, rolloutIngestHTTPRoute, key); err != nil {
+		if rolloutSearchHTTPRoute != "" || rolloutIngestHTTPRoute != "" || rolloutGatewayService != "" || rolloutGatewayServiceUID != "" {
+			if err := operationReconciler.ConfigureDevelopmentWeightedRollout(instanceReconciler, rolloutSearchHTTPRoute, rolloutIngestHTTPRoute, rolloutGatewayService, rolloutGatewayServiceUID, key); err != nil {
 				ctrl.Log.Error(err, "configure development weighted rollout")
 				os.Exit(1)
 			}

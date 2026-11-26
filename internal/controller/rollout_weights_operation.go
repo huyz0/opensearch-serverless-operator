@@ -51,6 +51,9 @@ func (r *OperationReconciler) reconcileWeightedOperation(ctx context.Context, re
 			return hold("WeightedRecoveryRequired", "Recover the weighted routes with a rollback before deleting the claimed operation")
 		}
 	}
+	if r.weightedGatewayMissing {
+		return hold("WeightedGatewayUnbound", "Configure the approved frontend Service namespace/name and UID before changing weighted traffic")
+	}
 	if r.weightedEvidence == nil || instance.Spec.Rollout == nil || !instance.Spec.Rollout.GatewayBackends {
 		return hold("WeightedRoutingUnavailable", "WeightedGateway requires configured role HTTPRoutes and fleet backends")
 	}

@@ -157,7 +157,18 @@ at two platform-managed HTTPRoutes in the instance namespace.
 ```text
 --development-rollout-search-httproute=catalog-search
 --development-rollout-ingest-httproute=catalog-index
+--development-rollout-gateway-service=envoy-gateway-system/<frontend-service>
+--development-rollout-gateway-service-uid=<frontend-service-uid>
 ```
+
+Use the exact Service and UID for the Envoy frontend that serves both
+routes. Apply the [frontend read Role](../../config/dev/weighted-rollout-frontend-rbac.example.yaml)
+in the Gateway namespace and bind it to the operator's ServiceAccount.
+The manager compares signed replica UIDs with live EndpointSlices and
+the ready Pods behind that Service, then rechecks their versions before
+applying a step. If an existing weighted deployment has neither frontend
+flag, weighted operations hold at `WeightedGatewayUnbound` until the
+administrator adds the binding.
 
 Set `resourceNames` in
 [weighted-rollout-rbac.example.yaml](../../config/dev/weighted-rollout-rbac.example.yaml)
