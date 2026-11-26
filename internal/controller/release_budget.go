@@ -2,9 +2,9 @@ package controller
 
 import (
 	"fmt"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"github.com/huyz0/opensearch-serverless-operator/api/v1alpha1"
 	"github.com/huyz0/opensearch-serverless-operator/pkg/podlifecycle"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"time"
 )
 

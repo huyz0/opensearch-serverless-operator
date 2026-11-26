@@ -29,11 +29,16 @@ jobs:
           git diff --exit-code -- api/v1alpha1/zz_generated.deepcopy.go config/generated-dev
       - name: Verify Pod lifecycle package dependencies
         run: |
+          module=$(go list -m)
           dependencies=$(go list -mod=readonly -deps ./pkg/podlifecycle/...)
-          if grep -E '^opensearch-serverless-operator/(api|cmd|internal)(/|$)' <<< "$dependencies"; then
-            echo 'The Pod lifecycle package depends on operator-specific code.'
-            exit 1
-          fi
+          while IFS= read -r dependency; do
+            case "$dependency" in
+              "$module"/api|"$module"/api/*|"$module"/cmd|"$module"/cmd/*|"$module"/internal|"$module"/internal/*)
+                printf 'The Pod lifecycle package depends on operator-specific code: %s\n' "$dependency"
+                exit 1
+                ;;
+            esac
+          done <<< "$dependencies"
       - name: Unit and race tests
         run: go test -race ./api/... ./pkg/... ./internal/... ./cmd/...
       - name: Plan verification

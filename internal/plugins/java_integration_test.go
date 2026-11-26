@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huyz0/opensearch-serverless-operator/internal/plugins"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/huyz0/opensearch-serverless-operator/internal/plugins"
 	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 )

@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/huyz0/opensearch-serverless-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
-	"github.com/huyz0/opensearch-serverless-operator/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 

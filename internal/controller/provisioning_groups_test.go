@@ -2,10 +2,10 @@ package controller
 
 import (
 	"context"
+	"github.com/huyz0/opensearch-serverless-operator/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"github.com/huyz0/opensearch-serverless-operator/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"testing"
 	"time"
