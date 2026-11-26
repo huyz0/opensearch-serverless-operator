@@ -14,7 +14,28 @@ spec:
     singular: opensearchserverlessoperation
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.instanceRef.name
+      name: Instance
+      type: string
+    - jsonPath: .spec.action
+      name: Action
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - description: Why this operation is waiting, failed, or completed
+      jsonPath: .status.conditions[?(@.type=='Ready')].reason
+      name: Reason
+      type: string
+    - jsonPath: .spec.targetFleet
+      name: Target Fleet
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: OpenSearchServerlessOperation requests an explicit action.
@@ -74,10 +95,13 @@ spec:
               expectedServingFleetByRole:
                 additionalProperties:
                   type: string
+                description: |-
+                  ExpectedServingFleetByRole is the observed source mapping keyed by search and ingest.
+                  A stale mapping causes the operation to hold before changing traffic.
                 type: object
               instanceRef:
-                description: InstanceReference identifies the instance targeted by
-                  an operation.
+                description: InstanceRef identifies the exact instance by name and
+                  UID.
                 properties:
                   name:
                     minLength: 1
@@ -168,6 +192,8 @@ spec:
               supersedesOperationUID:
                 type: string
               targetFleet:
+                description: TargetFleet is the staged candidate for promotion or
+                  the retained fleet for rollback.
                 type: string
               weightedTraffic:
                 description: |-

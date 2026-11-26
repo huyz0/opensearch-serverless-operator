@@ -41,10 +41,11 @@ jobs:
           done <<< "$dependencies"
       - name: Unit and race tests
         run: go test -race ./api/... ./pkg/... ./internal/... ./cmd/...
-      - name: Plan verification
+      - name: Plan and preview verification
         run: |
           python tools/verify_plan.py
           python tools/test_verify_plan.py
+          python tools/test_preview_operator_change.py
 
   development-release:
     runs-on: ubuntu-24.04

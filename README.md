@@ -1,5 +1,9 @@
 # OpenSearch Serverless Operator
 
+Follow [Deploy and change your first instance](docs/implementation/first-instance.md)
+to verify the two routes, preview per-AZ capacity changes, and inspect
+blue/green promotion and rollback.
+
 Build and run the current implementation with the
 [HTTPS and Basic Auth development install](config/operator-dev-secure/README.md).
 The [plain HTTP development install](config/operator-dev/README.md) is

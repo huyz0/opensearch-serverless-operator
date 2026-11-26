@@ -21,6 +21,12 @@ kubectl -n "$NS" create rolebinding opensearch-serverless-diagnostics \
 
 ## Establish current state
 
+Use `kubectl -n <namespace> get opensearchserverless -o wide` for
+availability, the recorded search and index intents, and the claimed
+operation. Use `kubectl -n <namespace> get opensearchserverlessoperations -o wide`
+to see its phase and reason. During an active rollout, read the Service
+selectors for live routing. [Preview both role routes](first-instance.md#preview-promotion-and-rollback)
+
 Set the namespace and instance name before running these checks.
 
 ```sh

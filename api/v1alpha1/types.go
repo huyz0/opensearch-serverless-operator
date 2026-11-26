@@ -29,8 +29,11 @@ type LocalReference struct {
 // +kubebuilder:validation:XValidation:rule="has(self.repositoryRef) ? !has(self.bucket) && !has(self.region) && !has(self.endpoint) && !has(self.pathStyleAccess) : has(self.bucket) && has(self.region)",message="select a repository reference or inline bucket and region"
 // +kubebuilder:validation:XValidation:rule="(oldSelf.hasValue() && self == oldSelf.value()) || (has(self.repositoryRef) || (has(self.bucket) && size(self.bucket) > 0 && has(self.region) && size(self.region) > 0))",optionalOldSelf=true,message="inline storage requires a nonempty bucket and region"
 type Storage struct {
+	// Type is s3. The bucket must already exist and be dedicated to this instance.
 	// +kubebuilder:validation:Enum=s3
-	Type            string              `json:"type"`
+	Type string `json:"type"`
+	// RepositoryRef names a ConfigMap in this namespace with bucket and region,
+	// and optional endpoint and pathStyleAccess. Use it instead of inline store fields.
 	RepositoryRef   *LocalReference     `json:"repositoryRef,omitempty"`
 	Bucket          string              `json:"bucket,omitempty"`
 	Region          string              `json:"region,omitempty"`
@@ -54,10 +57,13 @@ type StorageCredentials struct {
 // +kubebuilder:validation:XValidation:rule="self.minServing <= self.replicas + (has(self.warmSpare) ? self.warmSpare : 0)",message="minServing cannot exceed replicas plus warmSpare"
 // +kubebuilder:validation:XValidation:rule="self.replicas + (has(self.warmSpare) ? self.warmSpare : 0) <= 2147483647",message="total desired replicas exceeds int32"
 type Zone struct {
+	// Replicas is the base desired Pod count for this role in this zone.
 	// +kubebuilder:validation:Minimum=0
 	Replicas int32 `json:"replicas"`
+	// WarmSpare adds running Pods to this role and zone. It does not certify cache warmth.
 	// +kubebuilder:validation:Minimum=0
 	WarmSpare int32 `json:"warmSpare,omitempty"`
+	// MinServing is the zonal serving floor for guarded disruption. It cannot exceed replicas plus warmSpare.
 	// +kubebuilder:validation:Minimum=0
 	MinServing int32 `json:"minServing"`
 }
@@ -65,14 +71,18 @@ type Zone struct {
 // Pool configures one workload role.
 // +kubebuilder:validation:XValidation:rule="(oldSelf.hasValue() && self == oldSelf.value()) || ((!has(self.warmReadiness) || self.warmReadiness != 'Strict' || (has(self.warmOnJoin) && self.warmOnJoin)) && (!has(self.coldStartPolicy) || (has(self.warmReadiness) && self.warmReadiness == 'Strict')))",optionalOldSelf=true,message="strict warm readiness requires warmOnJoin and is required for coldStartPolicy"
 type Pool struct {
+	// Zones is keyed by the exact topology.kubernetes.io/zone values on eligible Nodes.
 	// +kubebuilder:validation:MinProperties=1
 	Zones              map[string]Zone             `json:"zones"`
 	CapacityProfileRef string                      `json:"capacityProfileRef,omitempty"`
 	Runtime            *RuntimeConfig              `json:"runtime,omitempty"`
 	Resources          corev1.ResourceRequirements `json:"resources,omitempty"`
-	JVMHeap            string                      `json:"jvmHeap,omitempty"`
-	Sidecars           []corev1.Container          `json:"sidecars,omitempty"`
-	NativeSidecars     []corev1.Container          `json:"nativeSidecars,omitempty"`
+	// JVMHeap sets the fixed Java heap for this role, for example 256Mi. Leave room for non-heap memory.
+	JVMHeap string `json:"jvmHeap,omitempty"`
+	// Sidecars are regular containers alongside the OpenSearch container in each Pod of this role.
+	Sidecars []corev1.Container `json:"sidecars,omitempty"`
+	// NativeSidecars are restartable init containers that stay running alongside OpenSearch.
+	NativeSidecars []corev1.Container `json:"nativeSidecars,omitempty"`
 	// +listType=map
 	// +listMapKey=name
 	SidecarVolumes []SidecarVolume `json:"sidecarVolumes,omitempty"`
@@ -102,8 +112,10 @@ type SidecarVolume struct {
 
 // RuntimeConfig contains startup settings and JVM arguments.
 type RuntimeConfig struct {
+	// Settings supplies OpenSearch startup settings. Use a separate operation for supported live cluster settings.
 	Settings map[string]string `json:"settings,omitempty"`
-	JVM      *JVMConfig        `json:"jvm,omitempty"`
+	// JVM supplies additional startup arguments and system properties. Set the managed heap with the pool's jvmHeap field.
+	JVM *JVMConfig `json:"jvm,omitempty"`
 }
 
 // FleetRuntime replaces the common and role-specific startup settings.
@@ -154,17 +166,22 @@ type SecretKeyReference struct {
 // TLSChannel references a leaf certificate and trust bundle.
 // +kubebuilder:validation:XValidation:rule="(self.source == 'CertManager') == has(self.issuerRef)",message="issuerRef is required only for CertManager"
 type TLSChannel struct {
+	// Source is Secret for supplied certificates or CertManager for an approved namespaced Issuer.
 	// +kubebuilder:validation:Enum=Secret;CertManager
 	Source string `json:"source"`
 	// CertificateRef names a Secret or a logical issuance slot for CertManager.
-	CertificateRef LocalReference     `json:"certificateRef"`
+	CertificateRef LocalReference `json:"certificateRef"`
+	// TrustBundleRef names a key containing the PEM CA bundle in a same-namespace Secret.
 	TrustBundleRef SecretKeyReference `json:"trustBundleRef"`
-	IssuerRef      *LocalReference    `json:"issuerRef,omitempty"`
+	// IssuerRef is required when source is CertManager.
+	IssuerRef *LocalReference `json:"issuerRef,omitempty"`
 }
 
 // TLSConfig keeps HTTP and peer transport trust boundaries distinct.
 type TLSConfig struct {
-	HTTP      *TLSChannel `json:"http,omitempty"`
+	// HTTP supplies TLS for search and index connections to the Java Pods.
+	HTTP *TLSChannel `json:"http,omitempty"`
+	// Transport supplies mutual TLS for peer connections between Java Pods.
 	Transport *TLSChannel `json:"transport,omitempty"`
 }
 
@@ -234,10 +251,13 @@ type EmergencyFailbackEvidence struct {
 type Rollout struct {
 	// +kubebuilder:validation:Enum=Rolling;BlueGreen
 	Strategy string `json:"strategy"`
+	// MaxPreviewReplicas bounds the candidate Pods across both roles and all zones.
 	// +kubebuilder:validation:Minimum=0
-	MaxPreviewReplicas int32           `json:"maxPreviewReplicas,omitempty"`
-	RollbackWindow     string          `json:"rollbackWindow,omitempty"`
-	Candidate          *FleetCandidate `json:"candidate,omitempty"`
+	MaxPreviewReplicas int32 `json:"maxPreviewReplicas,omitempty"`
+	// RollbackWindow sets the intended retention period for the former serving fleet, for example 30m.
+	RollbackWindow string `json:"rollbackWindow,omitempty"`
+	// Candidate stages a second fleet. A separate Promote operation requests the traffic switch.
+	Candidate *FleetCandidate `json:"candidate,omitempty"`
 	// GatewayBackends provisions stable ClusterIP Services for fleet routing.
 	GatewayBackends bool `json:"gatewayBackends,omitempty"`
 }
@@ -270,11 +290,13 @@ type FleetCandidate struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.rollout) || !has(self.rollout.candidate) || !has(self.rollout.candidate.runtimeOverride) || (self.rollout.strategy == 'BlueGreen' && has(self.rollout.rollbackWindow) && size(self.rollout.rollbackWindow) > 0)",message="candidate runtime override requires blue/green and a finite rollback window"
 // +kubebuilder:validation:XValidation:rule="(oldSelf.hasValue() && self.pools == oldSelf.value().pools) || (size(self.pools) == (('search' in self.pools ? 1 : 0) + ('ingest' in self.pools ? 1 : 0)) && (!('ingest' in self.pools) || ((!has(self.pools['ingest'].warmOnJoin) || !self.pools['ingest'].warmOnJoin) && !has(self.pools['ingest'].warmReadiness) && !has(self.pools['ingest'].coldStartPolicy))))",optionalOldSelf=true,message="pools support only search and ingest, and warm readiness belongs to search"
 type OpenSearchServerlessSpec struct {
+	// Image is the Java runtime image pinned by SHA-256 digest.
 	// +kubebuilder:validation:Pattern=`^.+@sha256:[a-f0-9]{64}$`
 	Image string `json:"image"`
 	// +kubebuilder:validation:MinLength=1
 	ServiceAccountName string  `json:"serviceAccountName"`
 	Storage            Storage `json:"storage"`
+	// Pools configures independent search and ingest roles. The ingest role serves the index route.
 	// +kubebuilder:validation:MinProperties=1
 	Pools        map[string]Pool `json:"pools"`
 	Runtime      *RuntimeConfig  `json:"runtime,omitempty"`
@@ -857,6 +879,12 @@ type PrimaryStoreStatus struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.podCreationSequence) || oldSelf.status.podCreationSequence == 0 || ((has(self.spec.tls) && has(self.spec.tls.http)) == (has(oldSelf.spec.tls) && has(oldSelf.spec.tls.http)))",message="HTTP TLS mode cannot change after Pod creation starts"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || ((!has(oldSelf.status.basicAuthBaseline) && (!has(oldSelf.status.podCreationSequence) || oldSelf.status.podCreationSequence == 0)) || ((has(self.spec.security) && self.spec.security.provider == 'ServerlessBasicAuth') == (has(oldSelf.spec.security) && oldSelf.spec.security.provider == 'ServerlessBasicAuth')))",message="Managed Basic Auth mode cannot change after Pod creation starts or credentials are pinned"
 // +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:printcolumn:name="Available",type=string,JSONPath=".status.conditions[?(@.type=='Available')].status",description="Last recorded Kubernetes endpoint availability condition"
+// +kubebuilder:printcolumn:name="Search Intent",type=string,JSONPath=".status.servingFleetIntentByRole.search",description="Recorded serving fleet intent for search"
+// +kubebuilder:printcolumn:name="Index Intent",type=string,JSONPath=".status.servingFleetIntentByRole.ingest",description="Recorded serving fleet intent for indexing"
+// +kubebuilder:printcolumn:name="Operation",type=string,JSONPath=".status.activeOperation.name",description="Current claimed operation"
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=".status.conditions[?(@.type=='Available')].reason",priority=1,description="Reason for the recorded availability condition"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 type OpenSearchServerless struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

@@ -1,5 +1,20 @@
 # Task handoff
 
+The first-instance guide covers secure setup, a write and search check,
+different warm-spare counts by role/AZ, and selector promotion and
+rollback. `kubectl get` displays instance availability, fleet intent,
+and the claimed operation. Operation rows show phase and condition
+reason. The read-only preview shows desired capacity and the last Ready
+sample, then reads both live stable Service selectors for a rollout.
+It reports differences between the live selectors and recorded intent.
+
+Local Go and Python checks, CRD regeneration, and the plan check passed.
+The Kubernetes 1.32 controller and Pod lifecycle suites passed on the
+local Windows envtest fixture. The controller test requested Kubernetes
+Table output to verify the new columns and their values. The preview
+tests used fixtures for split selectors, stale capacity, and rollback.
+This pass did not repeat a live Java or Envoy drill or a first-user trial.
+
 Two signed Kind writer fixtures exercised S3 throttling and a disconnect
 after eviction. Under `503 SlowDown`, the operator held the armed
 eviction. After restoration, the survivor served a term-4 write through

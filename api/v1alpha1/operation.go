@@ -115,13 +115,17 @@ type InstanceReference struct {
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || (!has(self.supersedesOperationUID) || size(self.supersedesOperationUID) == 0 || self.action == 'Rollback')",optionalOldSelf=true,message="only rollback can supersede an operation"
 // +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || (self.action in ['Promote', 'Rollback'] ? has(self.targetFleet) && size(self.targetFleet) > 0 && has(self.expectedServingFleetByRole) && size(self.expectedServingFleetByRole) == 2 && 'search' in self.expectedServingFleetByRole && size(self.expectedServingFleetByRole['search']) > 0 && 'ingest' in self.expectedServingFleetByRole && size(self.expectedServingFleetByRole['ingest']) > 0 : (!has(self.targetFleet) || size(self.targetFleet) == 0) && (!has(self.expectedServingFleetByRole) || size(self.expectedServingFleetByRole) == 0))",optionalOldSelf=true,message="only promotion and rollback require a target fleet and both expected role assignments"
 type OperationSpec struct {
+	// InstanceRef identifies the exact instance by name and UID.
 	InstanceRef InstanceReference `json:"instanceRef"`
 	// +kubebuilder:validation:Enum=Promote;Rollback;Decommission;ApplyClusterSettings;ApplySecurityConfiguration;RetryProvisioning;RetireWriter
 	Action string `json:"action"`
 	// +kubebuilder:validation:Enum=WeightedGateway
-	RoutingMode                string                       `json:"routingMode,omitempty"`
-	WeightedTraffic            *WeightedPromotionTraffic    `json:"weightedTraffic,omitempty"`
-	TargetFleet                string                       `json:"targetFleet,omitempty"`
+	RoutingMode     string                    `json:"routingMode,omitempty"`
+	WeightedTraffic *WeightedPromotionTraffic `json:"weightedTraffic,omitempty"`
+	// TargetFleet is the staged candidate for promotion or the retained fleet for rollback.
+	TargetFleet string `json:"targetFleet,omitempty"`
+	// ExpectedServingFleetByRole is the observed source mapping keyed by search and ingest.
+	// A stale mapping causes the operation to hold before changing traffic.
 	ExpectedServingFleetByRole map[string]string            `json:"expectedServingFleetByRole,omitempty"`
 	SupersedesOperationUID     string                       `json:"supersedesOperationUID,omitempty"`
 	ClusterSettings            *ClusterSettingsPatch        `json:"clusterSettings,omitempty"`
@@ -357,6 +361,12 @@ type SettingValue struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:printcolumn:name="Instance",type=string,JSONPath=".spec.instanceRef.name"
+// +kubebuilder:printcolumn:name="Action",type=string,JSONPath=".spec.action"
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].reason",description="Why this operation is waiting, failed, or completed"
+// +kubebuilder:printcolumn:name="Target Fleet",type=string,JSONPath=".spec.targetFleet",priority=1
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 type OpenSearchServerlessOperation struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

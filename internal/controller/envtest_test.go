@@ -13,6 +13,7 @@ import (
 	"errors"
 	"math/big"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	typedcore "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -68,6 +70,74 @@ type testSettingsBackend struct {
 	onRead       func() error
 	deferCommit  bool
 	commit       func()
+}
+
+func checkSummaryColumns(t *testing.T, ctx context.Context, kube client.Client, config *rest.Config, template *v1alpha1.OpenSearchServerless) {
+	t.Helper()
+	instance := &v1alpha1.OpenSearchServerless{
+		ObjectMeta: metav1.ObjectMeta{Name: "summary-catalog", Namespace: template.Namespace},
+		Spec:       *template.Spec.DeepCopy(),
+	}
+	if err := kube.Create(ctx, instance); err != nil {
+		t.Fatal(err)
+	}
+	operation := &v1alpha1.OpenSearchServerlessOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "summary-promote", Namespace: template.Namespace},
+		Spec: v1alpha1.OperationSpec{
+			InstanceRef: v1alpha1.InstanceReference{Name: instance.Name, UID: string(instance.UID)},
+			Action:      "Promote", TargetFleet: "green",
+			ExpectedServingFleetByRole: map[string]string{"search": "blue", "ingest": "blue"},
+		},
+	}
+	if err := kube.Create(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	instance.Status.ServingFleetIntentByRole = map[string]string{"search": "blue", "ingest": "blue"}
+	instance.Status.ActiveOperation = &v1alpha1.OperationClaim{Name: operation.Name, UID: string(operation.UID), Action: "Promote", Generation: operation.Generation}
+	meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{Type: "Available", Status: metav1.ConditionTrue, Reason: "KubernetesEndpointsObserved", Message: "Endpoints observed"})
+	if err := kube.Status().Update(ctx, instance); err != nil {
+		t.Fatal(err)
+	}
+	operation.Status.Phase = "Running"
+	meta.SetStatusCondition(&operation.Status.Conditions, metav1.Condition{Type: "Ready", Status: metav1.ConditionFalse, Reason: "CandidateNotQualified", Message: "Waiting for candidate"})
+	if err := kube.Status().Update(ctx, operation); err != nil {
+		t.Fatal(err)
+	}
+	core, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		resource, name string
+		want           map[string]string
+	}{
+		{"opensearchserverlesses", instance.Name, map[string]string{
+			"Available": "True", "Search Intent": "blue", "Index Intent": "blue", "Operation": operation.Name, "Reason": "KubernetesEndpointsObserved",
+		}},
+		{"opensearchserverlessoperations", operation.Name, map[string]string{
+			"Instance": instance.Name, "Action": "Promote", "Phase": "Running", "Reason": "CandidateNotQualified", "Target Fleet": "green",
+		}},
+	} {
+		path := "/apis/" + v1alpha1.GroupVersion.String() + "/namespaces/" + instance.Namespace + "/" + test.resource + "/" + test.name
+		raw, err := core.Discovery().RESTClient().Get().AbsPath(path).
+			SetHeader("Accept", "application/json;as=Table;g=meta.k8s.io;v=v1").DoRaw(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var table metav1.Table
+		if err := json.Unmarshal(raw, &table); err != nil {
+			t.Fatal(err)
+		}
+		if len(table.Rows) != 1 || len(table.Rows[0].Cells) != len(table.ColumnDefinitions) {
+			t.Fatalf("unexpected %s table: %#v", test.resource, table)
+		}
+		for name, value := range test.want {
+			column := slices.IndexFunc(table.ColumnDefinitions, func(column metav1.TableColumnDefinition) bool { return column.Name == name })
+			if column < 0 || table.Rows[0].Cells[column] != value {
+				t.Errorf("%s table must show %s=%q; got %#v", test.resource, name, value, table.Rows[0].Cells)
+			}
+		}
+	}
 }
 
 func (b *testSettingsBackend) Read(context.Context, *v1alpha1.OpenSearchServerless) (controller.SettingsRead, error) {
@@ -137,6 +207,9 @@ func TestAPIServerValidatesInstanceAndStatus(t *testing.T) {
 	if err := kube.Create(ctx, instance); err != nil {
 		t.Fatalf("create valid instance: %v", err)
 	}
+	t.Run("kubectl summary columns", func(t *testing.T) {
+		checkSummaryColumns(t, ctx, kube, config, instance)
+	})
 	t.Run("instance admission matches configured shapes", func(t *testing.T) {
 		checkInstanceAdmission(t, ctx, kube, instance)
 	})
